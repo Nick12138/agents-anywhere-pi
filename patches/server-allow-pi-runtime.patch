@@ -1,0 +1,13 @@
+diff --git a/server/agent_server/core/runtime_identity.py b/server/agent_server/core/runtime_identity.py
+index 4a62ebc..8c53688 100644
+--- a/server/agent_server/core/runtime_identity.py
++++ b/server/agent_server/core/runtime_identity.py
+@@ -20,7 +20,7 @@ RuntimeTypeId = NewType("RuntimeTypeId", str)
+ RuntimeInstanceId = NewType("RuntimeInstanceId", str)
+ ImplementationCategory = NewType("ImplementationCategory", str)
+ 
+-KNOWN_RUNTIME_TYPES = frozenset({"codex", "claude", "opencode", "acp", "dsh"})
++KNOWN_RUNTIME_TYPES = frozenset({"codex", "claude", "opencode", "acp", "dsh", "pi"})
+ MAX_RUNTIME_TYPE_LENGTH = 64
+ MAX_RUNTIME_INSTANCE_ID_LENGTH = 128
+ MAX_RUNTIME_INSTANCE_NAME_LENGTH = 128
