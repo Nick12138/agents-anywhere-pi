@@ -125,6 +125,9 @@ class PiRuntime(AgentRuntime):
         # 决定是否需要重新同步（polling 模式靠这个上报增量）。
         self._synced: dict[str, str] = {}
         self._index_refreshed_at = 0.0
+        # 前端发消息时带的 clientMessageId：写进时间线 item.source，客户端才能
+        # 把“本地乐观气泡”换成服务端条目，而不是再追加一条（否则同一条消息显示两遍）。
+        self._client_messages: dict[str, list[tuple[str, str]]] = {}
         self._catalog: tuple[float, tuple[int, int] | None, RuntimeModelCatalog] | None = None
         # 时间戳起点：进程重启后 revision 仍单调递增，避免服务端判成冲突。
         self._catalog_revision = int(time.time() * 1000)
@@ -305,6 +308,7 @@ class PiRuntime(AgentRuntime):
                 runtime_id=self.config.runtime_id,
             )
             self._snapshot_cache[str(path)] = (stat.st_mtime_ns, stat.st_size, snapshot)
+        snapshot = self._bind_client_message_ids(session_id, snapshot)
         if limit is not None and 0 < limit < len(snapshot.items):
             return RuntimeTimelineSnapshot(
                 session_id=snapshot.session_id,
@@ -571,6 +575,7 @@ class PiRuntime(AgentRuntime):
             raise RuntimeInvalidRequestError(str(exc)) from exc
         if disposition in {"started", "queued"}:
             self._activate(session_id, "running", summary)
+            self._remember_client_message(session_id, client_message_id, content)
         return RuntimeOperationResult(
             ok=True,
             result={
@@ -599,7 +604,53 @@ class PiRuntime(AgentRuntime):
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
         self._activate(session_id, "running", summary)
+        self._remember_client_message(session_id, client_message_id, content)
         return RuntimeOperationResult(ok=True, result={"clientMessageId": client_message_id})
+
+    def _remember_client_message(
+        self,
+        session_id: str,
+        client_message_id: str | None,
+        content: str,
+    ) -> None:
+        if not client_message_id:
+            return
+        bindings = self._client_messages.setdefault(session_id, [])
+        bindings.append((client_message_id, content))
+        del bindings[:-20]
+
+    def _bind_client_message_ids(
+        self,
+        session_id: str,
+        snapshot: RuntimeTimelineSnapshot,
+    ) -> RuntimeTimelineSnapshot:
+        bindings = self._client_messages.get(session_id)
+        if not bindings:
+            return snapshot
+        used: set[str] = set()
+        items: list[Any] = []
+        changed = False
+        for item in snapshot.items:
+            if (
+                item.type == "message"
+                and item.role == "user"
+                and "clientMessageId" not in item.source
+            ):
+                text = (item.content or {}).get("text")
+                for client_message_id, sent_text in bindings:
+                    if client_message_id in used or text != sent_text:
+                        continue
+                    used.add(client_message_id)
+                    item = replace(
+                        item,
+                        source={**item.source, "clientMessageId": client_message_id},
+                    )
+                    changed = True
+                    break
+            items.append(item)
+        if not changed:
+            return snapshot
+        return replace(snapshot, items=tuple(items))
 
     async def interrupt_session(
         self,

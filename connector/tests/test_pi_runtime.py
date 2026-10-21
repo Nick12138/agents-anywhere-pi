@@ -434,3 +434,40 @@ def test_session_state_reconciles_stale_running(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_user_message_carries_client_message_id(tmp_path: Path) -> None:
+    """前端靠 source.clientMessageId 把乐观气泡换成服务端条目，否则一条消息显示两遍。"""
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+
+        before = await runtime.get_session_snapshot(sid, ext)
+        user_items = [item for item in before.items if item.role == "user"]
+        assert user_items and "clientMessageId" not in user_items[0].source
+
+        runtime._remember_client_message(sid, "cmid-1", "帮我看看这个 bug")
+        after = await runtime.get_session_snapshot(sid, ext)
+        user_items = [item for item in after.items if item.role == "user"]
+        assert user_items[0].source["clientMessageId"] == "cmid-1"
+        # 只绑一次，重复读不会串到下一条
+        assert [item.source.get("clientMessageId") for item in after.items if item.role == "user"] == [
+            "cmid-1"
+        ]
+
+        # 后来又多了一条客户端消息也不会串号：还是只绑第一条用户消息
+        runtime._remember_client_message(sid, "cmid-2", "另一条消息")
+        again = await runtime.get_session_snapshot(sid, ext)
+        user_items = [item for item in again.items if item.role == "user"]
+        assert [item.source["clientMessageId"] for item in user_items] == ["cmid-1"]
+
+        await runtime.stop()
+
+    asyncio.run(run())
