@@ -48,6 +48,9 @@ Windows 上 Connector 会自己把 `pi` 解析成 `%APPDATA%\npm\pi.cmd`，
   `piabyssEnabledProviders` / `piabyssProviderModels` 过滤（跟随 PiAbyss
   设置 → 模型服务）。
 - 支持从 AA 新建会话：预建 Pi 会话文件后走同一条 RPC 通道发首条消息。
+- 流式输出：`pi --mode rpc` 的 `message_update` text_delta 会投影成一张
+  `status=running` 的临时气泡，按 120ms 节流 `timeline.itemUpsert` 推给服务端；
+  回合结束的完整快照会接管并把临时气泡替换成正式条目。
 - 时间线增量：`list_sessions` 上报 `sync.requires_timeline_sync`（对比文件
   mtime+size 指纹），回合开始/结束时立刻推一次 `timeline.sync`，手机上不用等
   30 秒轮询、也不会漏掉新回复。会话目录每 3 秒重扫一次，桌面端新建的会话能

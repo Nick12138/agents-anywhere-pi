@@ -116,6 +116,14 @@ class FakeHost:
 
     def __init__(self) -> None:
         self.catalogs = []
+        self.upserts = []
+        self.timelines = []
+
+    async def timeline_item_upsert(self, item) -> None:
+        self.upserts.append(item)
+
+    async def timeline_sync(self, **kwargs) -> None:
+        self.timelines.append(kwargs)
 
     async def model_catalog_update(self, catalog) -> None:
         self.catalogs.append(catalog)
@@ -566,6 +574,50 @@ def test_turn_with_server_side_session_id_binds_client_message(tmp_path: Path) -
         snapshot = await runtime.get_session_snapshot(foreign, ext)
         user = next(item for item in snapshot.items if item.role == "user")
         assert user.source["clientMessageId"] == "cmid-foreign"
+
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_streaming_pushes_growing_assistant_item(tmp_path: Path) -> None:
+    """流式输出：message_update 的 text_delta 要变成一张不断变长的气泡。"""
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+        summary = runtime._resolve(sid, ext)
+
+        runtime._handle_event(summary, {"type": "message_start", "message": {"role": "assistant"}})
+        for delta in ("你", "好", "呀"):
+            runtime._handle_event(
+                summary,
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": delta},
+                },
+            )
+        await asyncio.sleep(0.05)
+
+        assert host.upserts, "应该至少推一次流式气泡"
+        live = host.upserts[0]
+        assert live.status == "running" and live.role == "assistant"
+        assert live.content["text"].startswith("你")
+
+        snapshot = await runtime.get_session_snapshot(sid, ext)
+        running = [item for item in snapshot.items if item.status == "running"]
+        assert running and running[0].id == live.id
+
+        runtime._handle_event(summary, {"type": "message_end", "message": {"role": "assistant"}})
+        snapshot = await runtime.get_session_snapshot(sid, ext)
+        assert not [item for item in snapshot.items if item.status == "running"]
 
         await runtime.stop()
 

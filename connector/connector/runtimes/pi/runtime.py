@@ -38,12 +38,14 @@ from connector.runtime_protocol import (
     RuntimeOperationResult,
     RuntimePermissionCatalog,
     RuntimeStatus,
+    RuntimeTimelineItem,
     RuntimeTimelineSnapshot,
     RuntimeUnsupportedError,
     SessionMeta,
     SessionNotice,
     SessionSourceState,
     SessionState,
+    timeline_content_hash,
 )
 from connector.runtimes.pi.catalog import build_models, read_model_config
 from connector.runtimes.pi.discovery import resolve_executable
@@ -66,6 +68,10 @@ DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 CATALOG_TTL_SECONDS = 60.0
 INDEX_REFRESH_SECONDS = 3.0
 MAX_SNAPSHOT_ITEMS = 5_000
+# 流式推送节流：太快会把 websocket 刷爆，太慢手机上看着卡。
+STREAM_PUSH_MIN_INTERVAL_SECONDS = 0.12
+# 单个流式气泡最多推这么多字，剩下的等回合结束的完整快照。
+STREAM_MAX_CHARS = 100_000
 
 
 def _file_marker(path: Path) -> str | None:
@@ -89,6 +95,16 @@ def _sync_metadata(path: Path, synced: dict[str, str]) -> dict[str, Any]:
             "previous_marker": previous,
         }
     }
+
+
+@dataclass(slots=True)
+class LiveStream:
+    """正在流式输出的 assistant 消息（对应 `pi --mode rpc` 的 message_update）。"""
+
+    item_id: str
+    text: str = ""
+    last_push_at: float = 0.0
+    last_pushed_text: str = ""
 
 
 @dataclass(slots=True)
@@ -125,6 +141,10 @@ class PiRuntime(AgentRuntime):
         # 决定是否需要重新同步（polling 模式靠这个上报增量）。
         self._synced: dict[str, str] = {}
         self._index_refreshed_at = 0.0
+        # 流式输出：session -> 当前正在生成的气泡
+        self._streams: dict[str, LiveStream] = {}
+        self._stream_seq = 0
+        self._order_seq: dict[str, int] = {}
         # 前端发消息时带的 clientMessageId：写进时间线 item.source，客户端才能
         # 把“本地乐观气泡”换成服务端条目，而不是再追加一条（否则同一条消息显示两遍）。
         self._client_messages: dict[str, list[tuple[str, str]]] = {}
@@ -322,6 +342,7 @@ class PiRuntime(AgentRuntime):
             )
             self._snapshot_cache[str(path)] = (stat.st_mtime_ns, stat.st_size, snapshot)
         snapshot = self._bind_client_message_ids(session_id, snapshot)
+        snapshot = self._with_live_stream(session_id, snapshot)
         if requested_id and requested_id != session_id:
             snapshot = replace(snapshot, session_id=requested_id)
         if limit is not None and 0 < limit < len(snapshot.items):
@@ -850,6 +871,103 @@ class PiRuntime(AgentRuntime):
             except PiRpcError as exc:
                 logger.warning("pi set_thinking_level failed: %s", exc)
 
+    # ---- 流式输出 ----
+
+    def _handle_message_event(
+        self,
+        session_id: str,
+        summary: PiSessionFile,
+        record: Mapping[str, Any],
+    ) -> None:
+        """把 pi 的 message_* 事件投影成一张会不断增长的 assistant 气泡。"""
+        message = record.get("message")
+        role = message.get("role") if isinstance(message, Mapping) else None
+        event_type = record.get("type")
+        if event_type == "message_start":
+            if role != "assistant":
+                return
+            self._stream_seq += 1
+            self._streams[session_id] = LiveStream(item_id=f"pi:live:{self._stream_seq:x}")
+            return
+        stream = self._streams.get(session_id)
+        if stream is None:
+            return
+        if event_type == "message_end":
+            if role == "assistant":
+                # 最终内容由回合结束时的完整快照接管，这里只丢弃临时气泡。
+                self._streams.pop(session_id, None)
+            return
+        payload = record.get("assistantMessageEvent")
+        if not isinstance(payload, Mapping) or payload.get("type") != "text_delta":
+            return
+        delta = payload.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        if len(stream.text) >= STREAM_MAX_CHARS:
+            return
+        stream.text += delta
+        now = time.monotonic()
+        if now - stream.last_push_at < STREAM_PUSH_MIN_INTERVAL_SECONDS:
+            return
+        stream.last_push_at = now
+        stream.last_pushed_text = stream.text
+        path = str(summary.path.resolve())
+        self._spawn(self.host.timeline_item_upsert(self._live_item(session_id, path, stream)))
+
+    def _live_item(
+        self,
+        session_id: str,
+        path: str,
+        stream: LiveStream,
+        order_seq: int | None = None,
+    ) -> RuntimeTimelineItem:
+        content: dict[str, Any] = {"kind": "text", "text": stream.text, "format": "text"}
+        return RuntimeTimelineItem(
+            id=stream.item_id,
+            session_id=session_id,
+            type="message",
+            status="running",
+            role="assistant",
+            content=content,
+            source={
+                "runtime": "pi",
+                "sessionId": path,
+                "itemId": stream.item_id,
+                "itemType": "message",
+                "event": "message_update",
+                "runtimeId": self.config.runtime_id,
+            },
+            order_seq=order_seq if order_seq is not None else self._next_order_seq(session_id),
+            content_hash=timeline_content_hash(
+                item_type="message",
+                status="running",
+                role="assistant",
+                content=content,
+            ),
+        )
+
+    def _next_order_seq(self, session_id: str) -> int:
+        value = self._order_seq.get(session_id, 0) + 1
+        self._order_seq[session_id] = value
+        return value
+
+    def _with_live_stream(
+        self,
+        session_id: str,
+        snapshot: RuntimeTimelineSnapshot,
+    ) -> RuntimeTimelineSnapshot:
+        stream = self._streams.get(session_id)
+        if stream is None or not stream.text:
+            return snapshot
+        max_order = max((item.order_seq for item in snapshot.items), default=0)
+        live = self._live_item(
+            session_id,
+            snapshot.external_session_id or "",
+            stream,
+            order_seq=max_order + 1,
+        )
+        return replace(snapshot, items=(*snapshot.items, live))
+
     async def _publish_timeline(self, session_id: str, summary: PiSessionFile) -> None:
         """RPC 回合事件到达时立刻推一次时间线，并发完就记下指纹避免重复推。"""
         key = str(summary.path.resolve())
@@ -863,6 +981,11 @@ class PiRuntime(AgentRuntime):
             complete=snapshot.complete,
             metadata=snapshot.metadata,
         )
+        if snapshot.items:
+            self._order_seq[session_id] = max(
+                (item.order_seq for item in snapshot.items),
+                default=self._order_seq.get(session_id, 0),
+            )
         logger.info(
             "pi timeline published session=%s items=%s user=%s",
             session_id,
@@ -879,6 +1002,9 @@ class PiRuntime(AgentRuntime):
     def _handle_event(self, summary: PiSessionFile, record: dict[str, Any]) -> None:
         event_type = record.get("type")
         session_id = platform_session_id(self.host.connector_id, summary)
+        if event_type in {"message_start", "message_update", "message_end"}:
+            self._handle_message_event(session_id, summary, record)
+            return
         if event_type == "agent_start":
             logger.info("pi event agent_start session=%s", session_id)
             self._activate(session_id, "running", summary)
