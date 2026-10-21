@@ -19,7 +19,14 @@ git+https://github.com/Nick12138/agents-anywhere-pi#subdirectory=connector
 Agents Anywhere 刷新设备页会出现 **Pi Coding Agent**。
 
 运行的机器还需要有 `pi` 命令（或在 AA 的 Pi runtime 配置里填 `piPath` 绝对路径）。
-Pi 的会话、模型与认证都在 `~/.pi/agent`。
+Pi 的会话、模型与认证都在 `~/.pi/agent`。安装 Pi CLI：
+
+```bash
+npm i -g @earendil-works/pi-coding-agent@1.1.0   # 与 PiAbyss 内置版本一致
+```
+
+Windows 上 Connector 会自己把 `pi` 解析成 `%APPDATA%\npm\pi.cmd`，
+所以装好即可，不必手工填 `piPath`。
 
 ## 维护方式
 

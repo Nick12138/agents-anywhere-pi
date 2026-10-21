@@ -45,6 +45,7 @@ from connector.runtime_protocol import (
     SessionState,
 )
 from connector.runtimes.pi.catalog import build_models, read_model_config
+from connector.runtimes.pi.discovery import resolve_executable
 from connector.runtimes.pi.rpc import PiRpcError, PiRpcProcess, build_env
 from connector.runtimes.pi.sessions import (
     PiSessionFile,
@@ -112,8 +113,9 @@ class PiRuntime(AgentRuntime):
         return agent_dir(self.values)
 
     def _pi_executable(self) -> str:
-        configured = self.values.get("piPath")
-        return configured if isinstance(configured, str) and configured else "pi"
+        # Windows 上裸 "pi" 会让 CreateProcess 找不到 npm 的 pi.cmd（WinError 2），
+        # 所以这里和 discovery 用同一套解析：piPath → PATH 上的真实路径 → "pi"。
+        return resolve_executable(self.values) or "pi"
 
     def _extensions_enabled(self) -> bool:
         return bool(self.values.get("extensions", True))

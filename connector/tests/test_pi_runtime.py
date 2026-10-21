@@ -306,3 +306,27 @@ def test_model_config_reads_piabyss_enablement(tmp_path: Path) -> None:
     no_filter = read_model_config(tmp_path)
     assert no_filter.enabled_providers is None
     assert no_filter.provider_models == {}
+
+
+def test_pi_executable_resolves_from_path(monkeypatch, tmp_path: Path) -> None:
+    """Windows 上裸 `pi` 会让 CreateProcess 找不到 npm 的 pi.cmd，必须解析出真实路径。"""
+    from connector.runtimes.pi import discovery
+
+    async def run() -> None:
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+
+        monkeypatch.setattr(discovery.shutil, "which", lambda _name: None)
+        assert runtime._pi_executable() == "pi"
+
+        fake = tmp_path / "pi.cmd"
+        fake.write_text("", encoding="utf-8")
+        monkeypatch.setattr(discovery.shutil, "which", lambda _name: str(fake))
+        assert runtime._pi_executable() == str(fake)
+
+        await runtime.stop()
+
+    asyncio.run(run())
