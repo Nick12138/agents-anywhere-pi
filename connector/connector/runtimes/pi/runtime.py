@@ -239,6 +239,8 @@ class PiRuntime(AgentRuntime):
     ) -> SessionState | None:
         summary = self._resolve(session_id, external_session_id)
         status = self._active.get(session_id, "idle")
+        if status == "running":
+            status = await self._reconcile_running_status(session_id, summary)
         return SessionState(
             session_id=session_id,
             external_session_id=str(summary.path.resolve()),
@@ -247,6 +249,33 @@ class PiRuntime(AgentRuntime):
             selections=self._selections.get(session_id, {}),
             runtime_id=self.config.runtime_id,
         )
+
+    async def _reconcile_running_status(
+        self,
+        session_id: str,
+        summary: PiSessionFile,
+    ) -> RuntimeStatus:
+        """内存里的 running 可能因为丢了 agent_settled 永远卡住。
+
+        对存活过的 RPC 进程问一句 get_state：不在流式输出就是真的闲了。
+        """
+        key = str(summary.path.resolve())
+        process = self._processes.get(key)
+        if process is None or not process.running:
+            self._active.pop(session_id, None)
+            self._notices.pop(session_id, None)
+            return "idle"
+        try:
+            data = await process.request("get_state", timeout=min(5.0, self._request_timeout()))
+        except PiRpcError as exc:
+            logger.info("pi get_state failed while reconciling session=%s error=%s", session_id, exc)
+            return "running"
+        if data.get("isStreaming") is True:
+            return "running"
+        logger.info("pi session reconciled to idle (agent_settled was missed) session=%s", session_id)
+        self._active.pop(session_id, None)
+        self._notices.pop(session_id, None)
+        return "idle"
 
     async def get_session_snapshot(
         self,
@@ -753,10 +782,12 @@ class PiRuntime(AgentRuntime):
         event_type = record.get("type")
         session_id = platform_session_id(self.host.connector_id, summary)
         if event_type == "agent_start":
+            logger.info("pi event agent_start session=%s", session_id)
             self._activate(session_id, "running", summary)
             self._spawn(self._publish_timeline(session_id, summary))
             return
         if event_type == "agent_settled":
+            logger.info("pi event agent_settled session=%s aborted=%s", session_id, record.get("aborted") is True)
             self._active.pop(session_id, None)
             self._notices.pop(session_id, None)
             self._report_state(session_id, summary, "idle")

@@ -387,3 +387,50 @@ def test_timeline_sync_marker_tracks_file_changes(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_session_state_reconciles_stale_running(tmp_path: Path) -> None:
+    """丢了 agent_settled 时不能永远显示「正在工作」。"""
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+        key = str(Path(ext).resolve())
+
+        # 没有 RPC 进程存活 → 直接当成 idle
+        runtime._active[sid] = "running"
+        state = await runtime.get_session_state(sid, ext)
+        assert state is not None and state.status == "idle"
+        assert sid not in runtime._active
+
+        class StreamingProcess:
+            running = True
+
+            async def request(self, command, timeout=None, **fields):
+                assert command == "get_state"
+                return {"isStreaming": True}
+
+        class IdleProcess(StreamingProcess):
+            async def request(self, command, timeout=None, **fields):
+                return {"isStreaming": False}
+
+        runtime._active[sid] = "running"
+        runtime._processes[key] = StreamingProcess()  # type: ignore[assignment]
+        state = await runtime.get_session_state(sid, ext)
+        assert state is not None and state.status == "running"
+
+        runtime._processes[key] = IdleProcess()  # type: ignore[assignment]
+        state = await runtime.get_session_state(sid, ext)
+        assert state is not None and state.status == "idle"
+        assert sid not in runtime._active
+
+        runtime._processes.pop(key, None)
+        await runtime.stop()
+
+    asyncio.run(run())
