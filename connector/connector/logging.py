@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -24,6 +25,35 @@ def configure_connector_logging(*, debug: bool = False) -> None:
     level = "DEBUG" if debug else "INFO"
     logger.remove()
     logger.add(sys.stderr, level=level, format=DEFAULT_LOG_FORMAT)
+    _route_stdlib_logging(level)
+
+
+class _InterceptHandler(logging.Handler):
+    """把标准库 logging 转到 loguru。
+
+    runtime 模块用的是 `logging.getLogger(__name__)`，不接过来的话它的 INFO 日志
+    会直接丢掉（父 logger 没有 handler），出问题时根本看不到运行时内部发生了什么。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            sink_level = logger.level(record.levelname).name
+        except ValueError:
+            sink_level = record.levelno
+        logger.opt(exception=record.exc_info).log(
+            sink_level,
+            f"[{record.name}] {record.getMessage()}",
+        )
+
+
+def _route_stdlib_logging(level: str) -> None:
+    handler = _InterceptHandler()
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(level)
+    # 已知吵的库降到 WARNING，避免 INFO 日志被刷屏。
+    for name in ("asyncio", "httpx", "httpcore", "websockets", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 class RpcLogSink:

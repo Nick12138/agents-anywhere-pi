@@ -573,6 +573,12 @@ class PiRuntime(AgentRuntime):
                 disposition = data.get("disposition") if isinstance(data.get("disposition"), str) else "started"
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
+        logger.info(
+            "pi turn dispatched session=%s disposition=%s client_message_id=%s",
+            session_id,
+            disposition,
+            client_message_id,
+        )
         if disposition in {"started", "queued"}:
             self._activate(session_id, "running", summary)
             self._remember_client_message(session_id, client_message_id, content)
@@ -825,6 +831,16 @@ class PiRuntime(AgentRuntime):
             items=snapshot.items,
             complete=snapshot.complete,
             metadata=snapshot.metadata,
+        )
+        logger.info(
+            "pi timeline published session=%s items=%s user=%s",
+            session_id,
+            len(snapshot.items),
+            [
+                (item.id, item.source.get("clientMessageId"))
+                for item in snapshot.items
+                if item.type == "message" and item.role == "user"
+            ],
         )
         if marker is not None:
             self._synced[key] = marker
