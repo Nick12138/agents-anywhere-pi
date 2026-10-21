@@ -559,6 +559,10 @@ class PiRuntime(AgentRuntime):
             self._selections[session_id] = dict(selections)
         process = await self._ensure_process(summary)
         await self._apply_selections(session_id, process)
+        # 必须在 prompt 之前绑定：文件一写入就可能被轮询同步投影，
+        # 那条先发出去的条目要是缺 clientMessageId，服务端按 contentHash 判定
+        # 未变化，之后就再也补不上了（客户端于是多出一条乐观气泡）。
+        self._remember_client_message(session_id, client_message_id, content)
         running = self._active.get(session_id) in {"running", "waiting_approval", "stopping"}
         try:
             if running:
@@ -581,7 +585,6 @@ class PiRuntime(AgentRuntime):
         )
         if disposition in {"started", "queued"}:
             self._activate(session_id, "running", summary)
-            self._remember_client_message(session_id, client_message_id, content)
         return RuntimeOperationResult(
             ok=True,
             result={
@@ -605,12 +608,12 @@ class PiRuntime(AgentRuntime):
         process = self._processes.get(str(summary.path.resolve()))
         if process is None or not process.running:
             raise RuntimeInvalidRequestError("会话当前没有运行中的 Pi 进程")
+        self._remember_client_message(session_id, client_message_id, content)
         try:
             await process.send("steer", message=content)
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
         self._activate(session_id, "running", summary)
-        self._remember_client_message(session_id, client_message_id, content)
         return RuntimeOperationResult(ok=True, result={"clientMessageId": client_message_id})
 
     def _remember_client_message(
@@ -647,9 +650,13 @@ class PiRuntime(AgentRuntime):
                     if client_message_id in used or text != sent_text:
                         continue
                     used.add(client_message_id)
+                    # 服务端只按 contentHash 判断条目是否变化（见 upstream
+                    # core/timeline.py:timeline_item_state_is_unchanged），
+                    # 只改 source 的话更新会被丢弃。
                     item = replace(
                         item,
                         source={**item.source, "clientMessageId": client_message_id},
+                        content_hash=f"{item.content_hash}:cmid:{client_message_id}",
                     )
                     changed = True
                     break

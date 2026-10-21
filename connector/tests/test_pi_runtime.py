@@ -471,3 +471,46 @@ def test_user_message_carries_client_message_id(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_client_message_bound_before_prompt_and_hash_bumped(tmp_path: Path) -> None:
+    """绑定要早于 prompt（否则先发出去的条目缺 cmid），且 contentHash 要变。"""
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+
+        seen: list[list[tuple[str, str]]] = []
+
+        class FakeProcess:
+            running = True
+
+            async def request(self, command, timeout=None, **fields):
+                if command == "prompt":
+                    seen.append(list(runtime._client_messages.get(sid, [])))
+                return {"disposition": "started"}
+
+            async def send(self, command, **fields):
+                return None
+
+        async def fake_ensure(_summary):
+            return FakeProcess()
+
+        runtime._ensure_process = fake_ensure  # type: ignore[method-assign]
+        await runtime.start_turn(sid, ext, "帮我看看这个 bug", {}, (), "cmid-order")
+        assert seen == [[("cmid-order", "帮我看看这个 bug")]]
+
+        snapshot = await runtime.get_session_snapshot(sid, ext)
+        user = next(item for item in snapshot.items if item.role == "user")
+        assert user.source["clientMessageId"] == "cmid-order"
+        assert user.content_hash.endswith(":cmid:cmid-order")
+
+        await runtime.stop()
+
+    asyncio.run(run())
