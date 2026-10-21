@@ -141,6 +141,16 @@ class PiRuntime(AgentRuntime):
     async def get_config(self) -> RuntimeConfig:
         return self.config
 
+    def _canonical_session_id(self, summary: PiSessionFile) -> str:
+        """把调用方给的 session id 归一成本 runtime 内部的 id。
+
+        服务端会用自己那一套 session id 调 RPC（例如 sess_AAuQaz7Pp6sjhg），
+        而事件/轮询用的是 platform_session_id（sess_pi_...）。两套 id 指向同一个
+        JSONL，如果各存各的，_active/_selections/_client_messages 就会互相看不见——
+        表现为回合结束通知丢了、clientMessageId 对不上导致消息重复。
+        """
+        return platform_session_id(self.host.connector_id, summary)
+
     def _agent_dir(self) -> Path:
         return agent_dir(self.values)
 
@@ -241,15 +251,16 @@ class PiRuntime(AgentRuntime):
         external_session_id: str | None = None,
     ) -> SessionState | None:
         summary = self._resolve(session_id, external_session_id)
-        status = self._active.get(session_id, "idle")
+        canonical = self._canonical_session_id(summary)
+        status = self._active.get(canonical, "idle")
         if status == "running":
-            status = await self._reconcile_running_status(session_id, summary)
+            status = await self._reconcile_running_status(canonical, summary)
         return SessionState(
             session_id=session_id,
             external_session_id=str(summary.path.resolve()),
             runtime="pi",
             status=status,
-            selections=self._selections.get(session_id, {}),
+            selections=self._selections.get(canonical, {}),
             runtime_id=self.config.runtime_id,
         )
 
@@ -287,6 +298,8 @@ class PiRuntime(AgentRuntime):
         limit: int | None = None,
     ) -> RuntimeTimelineSnapshot:
         summary = self._resolve(session_id, external_session_id)
+        requested_id = session_id
+        session_id = self._canonical_session_id(summary)
         path = summary.path.resolve()
         try:
             stat = path.stat()
@@ -309,6 +322,8 @@ class PiRuntime(AgentRuntime):
             )
             self._snapshot_cache[str(path)] = (stat.st_mtime_ns, stat.st_size, snapshot)
         snapshot = self._bind_client_message_ids(session_id, snapshot)
+        if requested_id and requested_id != session_id:
+            snapshot = replace(snapshot, session_id=requested_id)
         if limit is not None and 0 < limit < len(snapshot.items):
             return RuntimeTimelineSnapshot(
                 session_id=snapshot.session_id,
@@ -555,6 +570,7 @@ class PiRuntime(AgentRuntime):
         if attachments:
             raise RuntimeUnsupportedError("pi runtime does not accept attachments yet")
         summary = self._resolve(session_id, external_session_id)
+        session_id = self._canonical_session_id(summary)
         if selections:
             self._selections[session_id] = dict(selections)
         process = await self._ensure_process(summary)
@@ -605,6 +621,7 @@ class PiRuntime(AgentRuntime):
         if attachments:
             raise RuntimeUnsupportedError("pi runtime does not accept attachments yet")
         summary = self._resolve(session_id, external_session_id)
+        session_id = self._canonical_session_id(summary)
         process = self._processes.get(str(summary.path.resolve()))
         if process is None or not process.running:
             raise RuntimeInvalidRequestError("会话当前没有运行中的 Pi 进程")
@@ -671,6 +688,7 @@ class PiRuntime(AgentRuntime):
         reason: str | None = None,
     ) -> RuntimeOperationResult:
         summary = self._resolve(session_id, None)
+        session_id = self._canonical_session_id(summary)
         process = self._processes.get(str(summary.path.resolve()))
         if process is None or not process.running:
             return RuntimeOperationResult(ok=True, result={"interrupted": False})
@@ -689,6 +707,7 @@ class PiRuntime(AgentRuntime):
         selections: Mapping[str, str | None],
     ) -> RuntimeOperationResult:
         summary = self._resolve(session_id, external_session_id)
+        session_id = self._canonical_session_id(summary)
         self._selections[session_id] = dict(selections)
         process = self._processes.get(str(summary.path.resolve()))
         if process is not None and process.running:
@@ -703,7 +722,11 @@ class PiRuntime(AgentRuntime):
         session_id: str,
         external_session_id: str | None = None,
     ) -> tuple[SessionNotice, ...]:
-        pending = self._notices.get(session_id, {})
+        summary = self._resolve(session_id, external_session_id) if external_session_id else None
+        if summary is None:
+            summary = self._index.get(session_id)
+        canonical = self._canonical_session_id(summary) if summary is not None else session_id
+        pending = self._notices.get(canonical, {})
         return tuple(item.notice for item in pending.values())
 
     async def respond_interaction(
@@ -713,11 +736,12 @@ class PiRuntime(AgentRuntime):
         action_id: str,
         input_data: Mapping[str, Any] | None = None,
     ) -> RuntimeOperationResult:
+        summary = self._resolve(session_id, None)
+        session_id = self._canonical_session_id(summary)
         pending = self._notices.get(session_id, {})
         interaction = pending.pop(notice_id, None)
         if interaction is None:
             raise RuntimeInvalidRequestError("交互请求不存在或已处理")
-        summary = self._resolve(session_id, None)
         process = self._processes.get(str(summary.path.resolve()))
         if process is None or not process.running:
             raise RuntimeInvalidRequestError("Pi 进程已退出，无法回答交互请求")

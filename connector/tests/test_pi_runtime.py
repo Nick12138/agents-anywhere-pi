@@ -514,3 +514,59 @@ def test_client_message_bound_before_prompt_and_hash_bumped(tmp_path: Path) -> N
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_turn_with_server_side_session_id_binds_client_message(tmp_path: Path) -> None:
+    """服务端会用自己那套 session id 调 RPC，内部状态必须归一到 platform id。"""
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+        listed = await runtime.list_sessions(limit=10, force=True)
+        canonical, ext = listed[0].session_id, listed[0].external_session_id
+        foreign = "sess_AAuQaz7Pp6sjhg"
+
+        class FakeProcess:
+            running = True
+
+            async def request(self, command, timeout=None, **fields):
+                if command == "get_state":
+                    return {"isStreaming": True}
+                return {"disposition": "started"}
+
+            async def send(self, command, **fields):
+                return None
+
+            async def close(self, *, grace: float = 0.0):
+                return None
+
+        async def fake_ensure(summary):
+            process = FakeProcess()
+            runtime._processes[str(summary.path.resolve())] = process  # type: ignore[assignment]
+            return process
+
+        runtime._ensure_process = fake_ensure  # type: ignore[method-assign]
+        await runtime.start_turn(foreign, ext, "帮我看看这个 bug", {}, (), "cmid-foreign")
+
+        # 内部状态统一挂在 platform id 下，事件路径才看得见
+        assert canonical in runtime._client_messages
+        assert canonical in runtime._active
+        assert foreign not in runtime._client_messages
+
+        state = await runtime.get_session_state(foreign, ext)
+        assert state is not None
+        # 对外仍回调用方的 id
+        assert state.session_id == foreign
+        assert state.status == "running"
+
+        snapshot = await runtime.get_session_snapshot(foreign, ext)
+        user = next(item for item in snapshot.items if item.role == "user")
+        assert user.source["clientMessageId"] == "cmid-foreign"
+
+        await runtime.stop()
+
+    asyncio.run(run())
