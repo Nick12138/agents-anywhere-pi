@@ -28,6 +28,28 @@ npm i -g @earendil-works/pi-coding-agent@1.1.0   # 与 PiAbyss 内置版本一�
 Windows 上 Connector 会自己把 `pi` 解析成 `%APPDATA%\npm\pi.cmd`，
 所以装好即可，不必手工填 `piPath`。
 
+## 多台设备 / 本地开发
+
+每台机器都装一份 Connector（各自 `~/.agents-anywhere/connector.json` 配对），
+会话文件在各自机器的 `~/.pi/agent/sessions`，互不影响。
+
+要在某台机器上「改代码即生效」（不用每次重装），在仓库根目录执行：
+
+```powershell
+# 前提：先在 PiAbyss 里完成一次重装，并把 connector 停止
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-local-connector.ps1
+# 顺便把安装源也改成这个本地目录：
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-local-connector.ps1 -UseLocalSource
+```
+
+脚本会把已安装的 `site-packages/connector` 换成指向本仓库的目录联接（junction），
+之后改代码只需在 PiAbyss 里「停止 → 启动」。**不要再点「重装」**，否则联接会被
+换回普通拷贝。macOS/Linux 等价做法：
+
+```bash
+ln -sfn "$PWD/connector/connector"   ~/.pi/agent/piabyss/remote/tools/anywhere-cli/lib/python3.*/site-packages/connector
+```
+
 ## 维护方式
 
 这个仓库是唯一维护的 connector 源码，日常改动直接在这里提交、推送；
