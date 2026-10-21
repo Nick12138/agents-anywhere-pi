@@ -48,6 +48,10 @@ Windows 上 Connector 会自己把 `pi` 解析成 `%APPDATA%\npm\pi.cmd`，
   `piabyssEnabledProviders` / `piabyssProviderModels` 过滤（跟随 PiAbyss
   设置 → 模型服务）。
 - 支持从 AA 新建会话：预建 Pi 会话文件后走同一条 RPC 通道发首条消息。
+- 时间线增量：`list_sessions` 上报 `sync.requires_timeline_sync`（对比文件
+  mtime+size 指纹），回合开始/结束时立刻推一次 `timeline.sync`，手机上不用等
+  30 秒轮询、也不会漏掉新回复。会话目录每 3 秒重扫一次，桌面端新建的会话能
+  自己冒出来。
 - 注册 `pi`：`runtimes/providers.py`、`server/capabilities.py` 白名单、
   协议 schema enum。
 - 版本号带本地后缀（`2.1.0+piabyss.N`），避免 uv 复用旧 wheel。

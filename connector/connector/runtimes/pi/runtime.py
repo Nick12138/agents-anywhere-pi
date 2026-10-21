@@ -28,6 +28,7 @@ from connector.runtime_protocol import (
     InputRequestForm,
     InputRequestOption,
     InputRequestQuestion,
+    PreparedSessionTimelineSync,
     RuntimeCapability,
     RuntimeCapabilitySet,
     RuntimeConfig,
@@ -63,7 +64,31 @@ logger = logging.getLogger(__name__)
 
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 CATALOG_TTL_SECONDS = 60.0
+INDEX_REFRESH_SECONDS = 3.0
 MAX_SNAPSHOT_ITEMS = 5_000
+
+
+def _file_marker(path: Path) -> str | None:
+    """会话文件的内容指纹：mtime+size 变了就认为需要重新同步时间线。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _sync_metadata(path: Path, synced: dict[str, str]) -> dict[str, Any]:
+    marker = _file_marker(path)
+    previous = synced.get(str(path.resolve()))
+    requires = marker is not None and marker != previous
+    return {
+        "sync": {
+            "marker": marker,
+            "requires_timeline_sync": requires,
+            "changed": requires,
+            "previous_marker": previous,
+        }
+    }
 
 
 @dataclass(slots=True)
@@ -96,6 +121,10 @@ class PiRuntime(AgentRuntime):
         self._selections: dict[str, dict[str, str | None]] = {}
         self._notices: dict[str, dict[str, PendingInteraction]] = {}
         self._snapshot_cache: dict[str, tuple[int, int, RuntimeTimelineSnapshot]] = {}
+        # 已发布到服务端的时间线指纹；list_sessions 拿它对比文件当前指纹，
+        # 决定是否需要重新同步（polling 模式靠这个上报增量）。
+        self._synced: dict[str, str] = {}
+        self._index_refreshed_at = 0.0
         self._catalog: tuple[float, tuple[int, int] | None, RuntimeModelCatalog] | None = None
         # 时间戳起点：进程重启后 revision 仍单调递增，避免服务端判成冲突。
         self._catalog_revision = int(time.time() * 1000)
@@ -150,6 +179,7 @@ class PiRuntime(AgentRuntime):
             platform_session_id(connector_id, summary): summary
             for summary in scan_sessions(self.values, connector_id)
         }
+        self._index_refreshed_at = time.monotonic()
 
     async def list_sessions(
         self,
@@ -157,7 +187,12 @@ class PiRuntime(AgentRuntime):
         cursor: str | None = None,
         force: bool = False,
     ) -> tuple[SessionMeta, ...]:
-        if force or not self._index:
+        if (
+            force
+            or not self._index
+            or time.monotonic() - self._index_refreshed_at > INDEX_REFRESH_SECONDS
+        ):
+            # 桌面端新建的会话不会经过 connector，定期重扫目录才能发现它们。
             self._refresh_index()
         sessions = sorted(
             self._index.values(),
@@ -180,6 +215,7 @@ class PiRuntime(AgentRuntime):
                         "nativeSessionId": summary.native_id,
                         "name": summary.name,
                         "sessionFormatVersion": 3,
+                        **_sync_metadata(summary.path, self._synced),
                     },
                     runtime_id=self.config.runtime_id,
                 )
@@ -252,6 +288,23 @@ class PiRuntime(AgentRuntime):
             )
         return snapshot
 
+    async def prepare_session_timeline_sync(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+    ) -> PreparedSessionTimelineSync:
+        """polling 同步入口：先读快照，发布成功后用 commit 记下指纹。"""
+        summary = self._resolve(session_id, external_session_id)
+        key = str(summary.path.resolve())
+        marker = _file_marker(summary.path)
+        snapshot = await self.get_session_snapshot(session_id, str(summary.path.resolve()))
+
+        async def commit() -> None:
+            if marker is not None:
+                self._synced[key] = marker
+
+        return PreparedSessionTimelineSync(snapshot=snapshot, commit=commit)
+
     async def resynchronize(
         self,
         session_id: str | None = None,
@@ -259,9 +312,11 @@ class PiRuntime(AgentRuntime):
     ) -> None:
         if session_id is None and external_session_id is None:
             self._snapshot_cache.clear()
+            self._synced.clear()
             return
         summary = self._resolve(session_id or "", external_session_id)
         self._snapshot_cache.pop(str(summary.path.resolve()), None)
+        self._synced.pop(str(summary.path.resolve()), None)
 
     # ---- capabilities / catalogs ----
 
@@ -678,16 +733,35 @@ class PiRuntime(AgentRuntime):
             except PiRpcError as exc:
                 logger.warning("pi set_thinking_level failed: %s", exc)
 
+    async def _publish_timeline(self, session_id: str, summary: PiSessionFile) -> None:
+        """RPC 回合事件到达时立刻推一次时间线，并发完就记下指纹避免重复推。"""
+        key = str(summary.path.resolve())
+        marker = _file_marker(summary.path)
+        snapshot = await self.get_session_snapshot(session_id, key)
+        await self.host.timeline_sync(
+            session_id=session_id,
+            runtime="pi",
+            external_session_id=key,
+            items=snapshot.items,
+            complete=snapshot.complete,
+            metadata=snapshot.metadata,
+        )
+        if marker is not None:
+            self._synced[key] = marker
+
     def _handle_event(self, summary: PiSessionFile, record: dict[str, Any]) -> None:
         event_type = record.get("type")
         session_id = platform_session_id(self.host.connector_id, summary)
         if event_type == "agent_start":
             self._activate(session_id, "running", summary)
+            self._spawn(self._publish_timeline(session_id, summary))
             return
         if event_type == "agent_settled":
             self._active.pop(session_id, None)
             self._notices.pop(session_id, None)
             self._report_state(session_id, summary, "idle")
+            # 手机端靠这条推送拿到这轮回复，不等 30s 的轮询。
+            self._spawn(self._publish_timeline(session_id, summary))
             outcome = "aborted" if record.get("aborted") is True else "completed"
             self._spawn(
                 self.host.session_turn_ended(

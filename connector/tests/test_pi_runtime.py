@@ -330,3 +330,60 @@ def test_pi_executable_resolves_from_path(monkeypatch, tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_timeline_sync_marker_tracks_file_changes(tmp_path: Path) -> None:
+    """polling 同步靠 sync 元数据判断增量；不设置就永远不会重新拉时间线。"""
+
+    async def run() -> None:
+        path = write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+
+        listed = await runtime.list_sessions(limit=10, force=True)
+        assert len(listed) == 1
+        sync = listed[0].metadata["sync"]
+        assert sync["requires_timeline_sync"] is True
+        assert sync["changed"] is True
+
+        prepared = await runtime.prepare_session_timeline_sync(
+            listed[0].session_id, listed[0].external_session_id
+        )
+        assert prepared.snapshot is not None and prepared.commit is not None
+        await prepared.commit()
+
+        listed = await runtime.list_sessions(limit=10, force=True)
+        assert listed[0].metadata["sync"]["requires_timeline_sync"] is False
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "u2",
+                        "parentId": "a1",
+                        "timestamp": "2026-01-01T00:00:05.000Z",
+                        "message": {"role": "user", "content": "再改一版", "timestamp": 5},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+        listed = await runtime.list_sessions(limit=10, force=True)
+        assert listed[0].metadata["sync"]["requires_timeline_sync"] is True
+
+        # resynchronize 会丢掉指纹，强制整会话重推
+        await runtime.prepare_session_timeline_sync(
+            listed[0].session_id, listed[0].external_session_id
+        )
+        await runtime.resynchronize(listed[0].session_id, listed[0].external_session_id)
+        listed = await runtime.list_sessions(limit=10, force=True)
+        assert listed[0].metadata["sync"]["requires_timeline_sync"] is True
+
+        await runtime.stop()
+
+    asyncio.run(run())
