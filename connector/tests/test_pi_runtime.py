@@ -622,3 +622,50 @@ def test_streaming_pushes_growing_assistant_item(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_session_state_recovers_selection_from_jsonl(tmp_path: Path) -> None:
+    """重启后从 JSONL 恢复当前模型，别让手机显示成默认模型。"""
+
+    async def run() -> None:
+        base = session_entries()
+        entries = [
+            base[0],
+            {
+                "type": "model_change",
+                "id": "m1",
+                "parentId": None,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "provider": "13",
+                "modelId": "deepseek-v4.1-flash",
+            },
+            {
+                "type": "thinking_level_change",
+                "id": "t1",
+                "parentId": "m1",
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "thinkingLevel": "high",
+            },
+            *base[1:],
+            {
+                "type": "model_change",
+                "id": "m2",
+                "parentId": "a1",
+                "timestamp": "2026-01-01T00:00:09.000Z",
+                "provider": "17",
+                "modelId": "GLM-5.3-Flash",
+            },
+        ]
+        write_session(tmp_path, "one", entries)
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+        listed = await runtime.list_sessions(limit=10, force=True)
+        state = await runtime.get_session_state(listed[0].session_id, listed[0].external_session_id)
+        assert state is not None
+        assert state.selections["model"] == "model:17/GLM-5.3-Flash#high"
+        await runtime.stop()
+
+    asyncio.run(run())

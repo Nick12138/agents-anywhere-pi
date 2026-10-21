@@ -275,14 +275,61 @@ class PiRuntime(AgentRuntime):
         status = self._active.get(canonical, "idle")
         if status == "running":
             status = await self._reconcile_running_status(canonical, summary)
+        selections = self._selections.get(canonical)
+        if not selections:
+            selections = self._selections_from_session(canonical, summary)
         return SessionState(
             session_id=session_id,
             external_session_id=str(summary.path.resolve()),
             runtime="pi",
             status=status,
-            selections=self._selections.get(canonical, {}),
+            selections=selections,
             runtime_id=self.config.runtime_id,
         )
+
+    def _selections_from_session(
+        self,
+        session_id: str,
+        summary: PiSessionFile,
+    ) -> dict[str, str]:
+        """从 JSONL 的 model_change / thinking_level_change 恢复当前选择。
+
+        connector 重启后内存里没有选择，不恢复的话手机上的模型选择器会显示成
+        默认模型（第一条），看起来像“切了模型没生效”。
+        """
+        provider: str | None = None
+        model_id: str | None = None
+        level: str | None = None
+        try:
+            entries = read_entries(summary.path)
+        except OSError:
+            entries = []
+        for entry in reversed(entries):
+            kind = entry.get("type")
+            if kind == "model_change" and provider is None:
+                value_provider = entry.get("provider")
+                value_model = entry.get("modelId")
+                if (
+                    isinstance(value_provider, str)
+                    and value_provider
+                    and isinstance(value_model, str)
+                    and value_model
+                ):
+                    provider, model_id = value_provider, value_model
+            elif kind == "thinking_level_change" and level is None:
+                value_level = entry.get("thinkingLevel")
+                if isinstance(value_level, str) and value_level:
+                    level = value_level
+            if provider is not None and level is not None:
+                break
+        if provider is None or model_id is None:
+            return {}
+        selection = f"model:{provider}/{model_id}"
+        if level:
+            selection = f"{selection}#{level}"
+        selections = {"model": selection}
+        self._selections[session_id] = selections
+        return selections
 
     async def _reconcile_running_status(
         self,
