@@ -775,6 +775,12 @@ class PiRuntime(AgentRuntime):
         selections: Mapping[str, str | None],
     ) -> RuntimeOperationResult:
         summary = self._resolve(session_id, external_session_id)
+        logger.info(
+            "pi selections update session=%s requested=%s selections=%s",
+            session_id,
+            external_session_id,
+            dict(selections),
+        )
         session_id = self._canonical_session_id(summary)
         self._selections[session_id] = dict(selections)
         process = self._processes.get(str(summary.path.resolve()))
@@ -899,6 +905,13 @@ class PiRuntime(AgentRuntime):
             raw, level = raw.split("#", 1)
         if "/" in raw:
             provider, model_id = raw.split("/", 1)
+            logger.info(
+                "pi apply selection session=%s provider=%s model=%s level=%s",
+                session_id,
+                provider,
+                model_id,
+                level,
+            )
             try:
                 await process.request(
                     "set_model",

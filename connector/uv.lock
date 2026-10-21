@@ -30,7 +30,7 @@ wheels = [
 
 [[package]]
 name = "anywhere-cli"
-version = "2.1.0+piabyss.14"
+version = "2.1.0+piabyss.15"
 source = { editable = "." }
 dependencies = [
     { name = "asyncer" },
