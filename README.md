@@ -47,7 +47,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-local-connec
 换回普通拷贝。macOS/Linux 等价做法：
 
 ```bash
-ln -sfn "$PWD/connector/connector"   ~/.pi/agent/piabyss/remote/tools/anywhere-cli/lib/python3.*/site-packages/connector
+ln -sfn "$PWD/connector/connector" ~/.pi/agent/piabyss/remote/tools/anywhere-cli/lib/python3.*/site-packages/connector
 ```
 
 ## 维护方式
