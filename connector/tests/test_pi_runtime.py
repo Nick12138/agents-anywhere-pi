@@ -118,12 +118,16 @@ class FakeHost:
         self.catalogs = []
         self.upserts = []
         self.timelines = []
+        self.attachments = {}
 
     async def timeline_item_upsert(self, item) -> None:
         self.upserts.append(item)
 
     async def timeline_sync(self, **kwargs) -> None:
         self.timelines.append(kwargs)
+
+    async def attachment_download(self, session_id, file_id):
+        return self.attachments[file_id]
 
     async def model_catalog_update(self, catalog) -> None:
         self.catalogs.append(catalog)
@@ -494,7 +498,7 @@ def test_client_message_bound_before_prompt_and_hash_bumped(tmp_path: Path) -> N
         listed = await runtime.list_sessions(limit=10, force=True)
         sid, ext = listed[0].session_id, listed[0].external_session_id
 
-        seen: list[list[tuple[str, str]]] = []
+        seen: list[list[object]] = []
 
         class FakeProcess:
             running = True
@@ -512,7 +516,10 @@ def test_client_message_bound_before_prompt_and_hash_bumped(tmp_path: Path) -> N
 
         runtime._ensure_process = fake_ensure  # type: ignore[method-assign]
         await runtime.start_turn(sid, ext, "帮我看看这个 bug", {}, (), "cmid-order")
-        assert seen == [[("cmid-order", "帮我看看这个 bug")]]
+        assert len(seen) == 1 and len(seen[0]) == 1
+        binding = seen[0][0]
+        assert binding.client_message_id == "cmid-order"
+        assert binding.text == "帮我看看这个 bug" 
 
         snapshot = await runtime.get_session_snapshot(sid, ext)
         user = next(item for item in snapshot.items if item.role == "user")
@@ -550,7 +557,7 @@ def test_turn_with_server_side_session_id_binds_client_message(tmp_path: Path) -
                 return None
 
             async def close(self, *, grace: float = 0.0):
-                return None
+                pass
 
         async def fake_ensure(summary):
             process = FakeProcess()
@@ -666,6 +673,79 @@ def test_session_state_recovers_selection_from_jsonl(tmp_path: Path) -> None:
         state = await runtime.get_session_state(listed[0].session_id, listed[0].external_session_id)
         assert state is not None
         assert state.selections["model"] == "model:17/GLM-5.3-Flash#high"
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_attachments_go_to_pi_images_and_files(tmp_path: Path, monkeypatch) -> None:
+    """图片塞进 rpc 的 images；其他文件落盘并把路径写进提示词。"""
+
+    from connector.runtime_protocol import RuntimeAttachment, RuntimeAttachmentContent
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        host.attachments = {
+            "file_img": RuntimeAttachmentContent(
+                file_id="file_img", name="shot.png", media_type="image/png", content=png
+            ),
+            "file_doc": RuntimeAttachmentContent(
+                file_id="file_doc", name="notes.md", media_type="text/markdown", content="# 标题".encode()
+            ),
+        }
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+
+        calls: list[dict] = []
+
+        class FakeProcess:
+            running = True
+
+            async def request(self, command, timeout=None, **fields):
+                if command == "prompt":
+                    calls.append(fields)
+                    return {"disposition": "started"}
+                return {}
+
+            async def send(self, command, **fields):
+                calls.append(fields)
+
+            async def close(self, *, grace: float = 0.0):
+                pass
+
+        async def fake_ensure(_summary):
+            return FakeProcess()
+
+        runtime._ensure_process = fake_ensure  # type: ignore[method-assign]
+        attachments = (
+            RuntimeAttachment(file_id="file_img", name="shot.png", media_type="image/png", size=len(png)),
+            RuntimeAttachment(file_id="file_doc", name="notes.md", media_type="text/markdown", size=4),
+        )
+        await runtime.start_turn(sid, ext, "帮我看看这个 bug", {}, attachments, "cmid-files")
+
+        prompt = calls[0]
+        assert prompt["message"].startswith("帮我看看这个 bug")
+        assert "notes.md" in prompt["message"] and "shot.png" not in prompt["message"]
+        assert len(prompt["images"]) == 1
+        assert prompt["images"][0]["mimeType"] == "image/png"
+        assert prompt["images"][0]["type"] == "image"
+        assert prompt["images"][0]["data"]
+
+        snapshot = await runtime.get_session_snapshot(sid, ext)
+        user = next(item for item in snapshot.items if item.role == "user")
+        names = [a["name"] for a in user.content["attachments"]]
+        assert names == ["shot.png", "notes.md"]
+        assert user.source["clientMessageId"] == "cmid-files"
+
         await runtime.stop()
 
     asyncio.run(run())

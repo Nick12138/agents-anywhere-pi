@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import time
 from collections.abc import Mapping
@@ -20,6 +21,7 @@ from typing import Any
 
 from connector.runtime_protocol import (
     CAPABILITY_CATALOG_MODEL,
+    CAPABILITY_RUNTIME_ATTACHMENT,
     CAPABILITY_SESSION_INTERACTION_APPROVAL,
     CAPABILITY_SESSION_INTERRUPT,
     CAPABILITY_SESSION_SEND_MESSAGE,
@@ -47,6 +49,7 @@ from connector.runtime_protocol import (
     SessionState,
     timeline_content_hash,
 )
+from connector.runtime_protocol.attachments import attachment_target
 from connector.runtimes.pi.catalog import build_models, read_model_config
 from connector.runtimes.pi.discovery import resolve_executable
 from connector.runtimes.pi.rpc import PiRpcError, PiRpcProcess, build_env
@@ -72,6 +75,10 @@ MAX_SNAPSHOT_ITEMS = 5_000
 STREAM_PUSH_MIN_INTERVAL_SECONDS = 0.12
 # 单个流式气泡最多推这么多字，剩下的等回合结束的完整快照。
 STREAM_MAX_CHARS = 100_000
+# 图片直接塞进 pi 的 RPC（base64），太大就落盘让 pi 自己读。
+MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_INLINE_IMAGES = 8
+ATTACHMENT_ONLY_PROMPT = "（我发来了附件，请查看）" 
 
 
 def _file_marker(path: Path) -> str | None:
@@ -95,6 +102,15 @@ def _sync_metadata(path: Path, synced: dict[str, str]) -> dict[str, Any]:
             "previous_marker": previous,
         }
     }
+
+
+@dataclass(slots=True)
+class ClientMessage:
+    """一条来自客户端的消息：clientMessageId + 文本 + 附件元信息。"""
+
+    client_message_id: str
+    text: str
+    attachments: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(slots=True)
@@ -147,7 +163,7 @@ class PiRuntime(AgentRuntime):
         self._order_seq: dict[str, int] = {}
         # 前端发消息时带的 clientMessageId：写进时间线 item.source，客户端才能
         # 把“本地乐观气泡”换成服务端条目，而不是再追加一条（否则同一条消息显示两遍）。
-        self._client_messages: dict[str, list[tuple[str, str]]] = {}
+        self._client_messages: dict[str, list[ClientMessage]] = {}
         self._catalog: tuple[float, tuple[int, int] | None, RuntimeModelCatalog] | None = None
         # 时间戳起点：进程重启后 revision 仍单调递增，避免服务端判成冲突。
         self._catalog_revision = int(time.time() * 1000)
@@ -456,6 +472,7 @@ class PiRuntime(AgentRuntime):
                 self._capability(CAPABILITY_SESSION_STEER),
                 self._capability(CAPABILITY_SESSION_INTERRUPT),
                 self._capability(CAPABILITY_SESSION_INTERACTION_APPROVAL),
+                self._capability(CAPABILITY_RUNTIME_ATTACHMENT),
             ),
             connector_id=self.host.connector_id,
             runtime_id=self.config.runtime_id,
@@ -475,6 +492,7 @@ class PiRuntime(AgentRuntime):
                 self._capability(CAPABILITY_SESSION_STEER, session_id),
                 self._capability(CAPABILITY_SESSION_INTERRUPT, session_id),
                 self._capability(CAPABILITY_SESSION_INTERACTION_APPROVAL, session_id),
+                self._capability(CAPABILITY_RUNTIME_ATTACHMENT, session_id),
             ),
             session_id=session_id,
             connector_id=self.host.connector_id,
@@ -594,8 +612,6 @@ class PiRuntime(AgentRuntime):
     ) -> RuntimeOperationResult:
         if runtime_options:
             raise RuntimeUnsupportedError("runtimeOptions")
-        if attachments:
-            raise RuntimeUnsupportedError("pi runtime does not accept attachments yet")
         configured = self.values.get("cwd")
         target_cwd = (
             cwd
@@ -613,6 +629,7 @@ class PiRuntime(AgentRuntime):
                 external_session_id=str(summary.path.resolve()),
                 content=content,
                 selections=selections,
+                attachments=attachments,
                 client_message_id=client_message_id,
             )
         except Exception:
@@ -635,28 +652,33 @@ class PiRuntime(AgentRuntime):
         client_message_id: str | None = None,
         cwd: str | None = None,
     ) -> RuntimeOperationResult:
-        if attachments:
-            raise RuntimeUnsupportedError("pi runtime does not accept attachments yet")
         summary = self._resolve(session_id, external_session_id)
         session_id = self._canonical_session_id(summary)
         if selections:
             self._selections[session_id] = dict(selections)
         process = await self._ensure_process(summary)
         await self._apply_selections(session_id, process)
+        prompt_text, images, attachment_meta = await self._prepare_attachments(
+            session_id,
+            content,
+            attachments,
+        )
         # 必须在 prompt 之前绑定：文件一写入就可能被轮询同步投影，
         # 那条先发出去的条目要是缺 clientMessageId，服务端按 contentHash 判定
         # 未变化，之后就再也补不上了（客户端于是多出一条乐观气泡）。
-        self._remember_client_message(session_id, client_message_id, content)
+        self._remember_client_message(session_id, client_message_id, content, attachment_meta)
         running = self._active.get(session_id) in {"running", "waiting_approval", "stopping"}
+        extra: dict[str, Any] = {"images": images} if images else {}
         try:
             if running:
-                await process.send("steer", message=content)
+                await process.send("steer", message=prompt_text, **extra)
                 disposition = "queued"
             else:
                 data = await process.request(
                     "prompt",
                     timeout=self._request_timeout(),
-                    message=content,
+                    message=prompt_text,
+                    **extra,
                 )
                 disposition = data.get("disposition") if isinstance(data.get("disposition"), str) else "started"
         except PiRpcError as exc:
@@ -686,16 +708,23 @@ class PiRuntime(AgentRuntime):
         attachments: tuple[Any, ...] = (),
         client_message_id: str | None = None,
     ) -> RuntimeOperationResult:
-        if attachments:
-            raise RuntimeUnsupportedError("pi runtime does not accept attachments yet")
         summary = self._resolve(session_id, external_session_id)
         session_id = self._canonical_session_id(summary)
         process = self._processes.get(str(summary.path.resolve()))
         if process is None or not process.running:
             raise RuntimeInvalidRequestError("会话当前没有运行中的 Pi 进程")
-        self._remember_client_message(session_id, client_message_id, content)
+        prompt_text, images, attachment_meta = await self._prepare_attachments(
+            session_id,
+            content,
+            attachments,
+        )
+        self._remember_client_message(session_id, client_message_id, content, attachment_meta)
         try:
-            await process.send("steer", message=content)
+            await process.send(
+                "steer",
+                message=prompt_text,
+                **({"images": images} if images else {}),
+            )
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
         self._activate(session_id, "running", summary)
@@ -706,12 +735,76 @@ class PiRuntime(AgentRuntime):
         session_id: str,
         client_message_id: str | None,
         content: str,
+        attachments: tuple[dict[str, Any], ...] = (),
     ) -> None:
         if not client_message_id:
             return
         bindings = self._client_messages.setdefault(session_id, [])
-        bindings.append((client_message_id, content))
+        bindings.append(ClientMessage(client_message_id, content, attachments))
         del bindings[:-20]
+
+    async def _prepare_attachments(
+        self,
+        session_id: str,
+        content: str,
+        attachments: tuple[Any, ...],
+    ) -> tuple[str, list[dict[str, Any]], tuple[dict[str, Any], ...]]:
+        """把 AA 的附件变成 pi 能用的形态。
+
+        - 图片：base64 塞进 rpc 的 `images`（pi 会存进会话 JSONL，模型直接看得到）
+        - 其他文件：落到 connector 数据目录，再把路径写进提示词，让 pi 自己 read
+        """
+        if not attachments:
+            return content, [], ()
+        images: list[dict[str, Any]] = []
+        notes: list[str] = []
+        meta: list[dict[str, Any]] = []
+        for attachment in attachments:
+            downloaded = await self.host.attachment_download(session_id, attachment.file_id)
+            data = downloaded.content
+            media_type = (
+                (downloaded.media_type or attachment.media_type or "application/octet-stream")
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
+            name = attachment.name or downloaded.name or attachment.file_id
+            if (
+                media_type.startswith("image/")
+                and len(data) <= MAX_INLINE_IMAGE_BYTES
+                and len(images) < MAX_INLINE_IMAGES
+            ):
+                images.append(
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "mimeType": media_type,
+                    }
+                )
+            else:
+                target = attachment_target(session_id, attachment.file_id, name)
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                target.write_bytes(data)
+                notes.append(f"- {name} ({media_type}): {target}")
+            meta.append(
+                {
+                    "fileId": attachment.file_id,
+                    "name": name,
+                    "mediaType": media_type,
+                    "size": len(data),
+                }
+            )
+        text = content.strip() or ATTACHMENT_ONLY_PROMPT
+        if notes:
+            listing = "\n".join(notes)
+            text = f"{text}\n\n以下附件已保存到本机，需要时用 read 等工具打开：\n{listing}"
+        logger.info(
+            "pi attachments prepared session=%s images=%s files=%s",
+            session_id,
+            len(images),
+            len(notes),
+        )
+        return text, images, tuple(meta)
 
     def _bind_client_message_ids(
         self,
@@ -731,17 +824,24 @@ class PiRuntime(AgentRuntime):
                 and "clientMessageId" not in item.source
             ):
                 text = (item.content or {}).get("text")
-                for client_message_id, sent_text in bindings:
-                    if client_message_id in used or text != sent_text:
+                for binding in bindings:
+                    if binding.client_message_id in used or text != binding.text:
                         continue
-                    used.add(client_message_id)
+                    used.add(binding.client_message_id)
+                    content = dict(item.content or {})
+                    if binding.attachments:
+                        content["attachments"] = [dict(a) for a in binding.attachments]
                     # 服务端只按 contentHash 判断条目是否变化（见 upstream
                     # core/timeline.py:timeline_item_state_is_unchanged），
                     # 只改 source 的话更新会被丢弃。
                     item = replace(
                         item,
-                        source={**item.source, "clientMessageId": client_message_id},
-                        content_hash=f"{item.content_hash}:cmid:{client_message_id}",
+                        content=content,
+                        source={
+                            **item.source,
+                            "clientMessageId": binding.client_message_id,
+                        },
+                        content_hash=f"{item.content_hash}:cmid:{binding.client_message_id}",
                     )
                     changed = True
                     break

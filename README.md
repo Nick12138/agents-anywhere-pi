@@ -48,6 +48,9 @@ Windows 上 Connector 会自己把 `pi` 解析成 `%APPDATA%\npm\pi.cmd`，
   `piabyssEnabledProviders` / `piabyssProviderModels` 过滤（跟随 PiAbyss
   设置 → 模型服务）。
 - 支持从 AA 新建会话：预建 Pi 会话文件后走同一条 RPC 通道发首条消息。
+- 附件：图片（≤8MB、最多 8 张）转 base64 走 rpc 的 `images`，pi 会写进会话
+  JSONL，模型直接看得到；其他文件落到 connector 数据目录，并把本机路径写进
+  提示词让 pi 自己 `read`。时间线里会带上附件元信息（文件名/类型/大小）。
 - 流式输出：`pi --mode rpc` 的 `message_update` text_delta 会投影成一张
   `status=running` 的临时气泡，按 120ms 节流 `timeline.itemUpsert` 推给服务端；
   回合结束的完整快照会接管并把临时气泡替换成正式条目。
