@@ -51,9 +51,12 @@ Windows 上 Connector 会自己把 `pi` 解析成 `%APPDATA%\npm\pi.cmd`，
 - 附件：图片（≤8MB、最多 8 张）转 base64 走 rpc 的 `images`，pi 会写进会话
   JSONL，模型直接看得到；其他文件落到 connector 数据目录，并把本机路径写进
   提示词让 pi 自己 `read`。时间线里会带上附件元信息（文件名/类型/大小）。
-- 流式输出：`pi --mode rpc` 的 `message_update` text_delta 会投影成一张
+- 流式输出：`pi --mode rpc` 的 `message_update` 会把 text / thinking / toolCall
+  都投影成 `status=running` 的临时卡片（文本、思考、工具各一张），text 会投影成一张
   `status=running` 的临时气泡，按 120ms 节流 `timeline.itemUpsert` 推给服务端；
   回合结束的完整快照会接管并把临时气泡替换成正式条目。
+- 失败可见：`stopReason=error` 的回合会投影成一条 error 气泡（以前空正文被整个
+  跳过，手机端什么都看不到）；pi 自动重试期间也会显示「Connection error（自动重试 1/3）」。
 - 时间线增量：`list_sessions` 上报 `sync.requires_timeline_sync`（对比文件
   mtime+size 指纹），回合开始/结束时立刻推一次 `timeline.sync`，手机上不用等
   30 秒轮询、也不会漏掉新回复。会话目录每 3 秒重扫一次，桌面端新建的会话能

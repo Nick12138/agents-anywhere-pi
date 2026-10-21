@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,16 @@ def _file_marker(path: Path) -> str | None:
     return f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
+def _serialize_tool_input(value: Any, limit: int = 4_000) -> str | None:
+    if value is None:
+        return None
+    try:
+        text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    return text[:limit]
+
+
 def _sync_metadata(path: Path, synced: dict[str, str]) -> dict[str, Any]:
     marker = _file_marker(path)
     previous = synced.get(str(path.resolve()))
@@ -119,8 +130,10 @@ class LiveStream:
 
     item_id: str
     text: str = ""
+    thinking: str = ""
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
     last_push_at: float = 0.0
-    last_pushed_text: str = ""
 
 
 @dataclass(slots=True)
@@ -161,6 +174,8 @@ class PiRuntime(AgentRuntime):
         self._streams: dict[str, LiveStream] = {}
         self._stream_seq = 0
         self._order_seq: dict[str, int] = {}
+        # 自动重试中的提示（pi 会自己重试，但手机得看到发生了什么）
+        self._retry_notices: dict[str, str] = {}
         # 前端发消息时带的 clientMessageId：写进时间线 item.source，客户端才能
         # 把“本地乐观气泡”换成服务端条目，而不是再追加一条（否则同一条消息显示两遍）。
         self._client_messages: dict[str, list[ClientMessage]] = {}
@@ -1039,10 +1054,10 @@ class PiRuntime(AgentRuntime):
         summary: PiSessionFile,
         record: Mapping[str, Any],
     ) -> None:
-        """把 pi 的 message_* 事件投影成一张会不断增长的 assistant 气泡。"""
+        """把 pi 的 message_* 事件投影成会不断增长的文本 / 思考 / 工具卡片。"""
+        event_type = record.get("type")
         message = record.get("message")
         role = message.get("role") if isinstance(message, Mapping) else None
-        event_type = record.get("type")
         if event_type == "message_start":
             if role != "assistant":
                 return
@@ -1058,50 +1073,248 @@ class PiRuntime(AgentRuntime):
                 self._streams.pop(session_id, None)
             return
         payload = record.get("assistantMessageEvent")
-        if not isinstance(payload, Mapping) or payload.get("type") != "text_delta":
+        if not isinstance(payload, Mapping):
             return
-        delta = payload.get("delta")
-        if not isinstance(delta, str) or not delta:
+        kind = payload.get("type")
+        if kind == "error":
+            failed = payload.get("error")
+            message_text = failed.get("errorMessage") if isinstance(failed, Mapping) else None
+            stream.error = (
+                message_text.strip()
+                if isinstance(message_text, str) and message_text.strip()
+                else "模型调用失败"
+            )
+            self._push_live(session_id, summary, stream, force=True)
+            self._streams.pop(session_id, None)
             return
-        if len(stream.text) >= STREAM_MAX_CHARS:
+        if kind == "toolcall_end":
+            # pi 的 toolcall 事件不带 partial，只有 toolcall_end 里有完整 toolCall。
+            tool_call = payload.get("toolCall")
+            if isinstance(tool_call, Mapping):
+                tool_id = tool_call.get("id")
+                title = tool_call.get("name")
+                entries = stream.tools
+                if not any(
+                    entry.get("id") == tool_id for entry in entries
+                ) if isinstance(tool_id, str) else True:
+                    entries.append(
+                        {
+                            "id": tool_id if isinstance(tool_id, str) else None,
+                            "title": title if isinstance(title, str) else None,
+                            "input": tool_call.get("arguments"),
+                        }
+                    )
+        partial = payload.get("partial")
+        if isinstance(partial, Mapping):
+            self._apply_partial(stream, partial)
+        else:
+            # 兜底：老版本 rpc 可能只带 delta
+            delta = payload.get("delta")
+            if isinstance(delta, str) and delta:
+                if kind == "text_delta":
+                    stream.text = (stream.text + delta)[:STREAM_MAX_CHARS]
+                elif kind == "thinking_delta":
+                    stream.thinking = (stream.thinking + delta)[:STREAM_MAX_CHARS]
+        if not isinstance(kind, str):
             return
-        stream.text += delta
+        if kind not in {"text_delta", "thinking_delta", "done"} and not kind.startswith("toolcall"):
+            return
+        # 工具回合/消息结束这些「形状变化」必须立刻推，别被节流吞掉。
+        self._push_live(
+            session_id,
+            summary,
+            stream,
+            force=kind == "done" or kind.startswith("toolcall"),
+        )
+
+    @staticmethod
+    def _apply_partial(stream: LiveStream, partial: Mapping[str, Any]) -> None:
+        """`partial` 里是这条消息到目前为止的完整内容，照抄比累加 delta 稳。"""
+        texts: list[str] = []
+        thinking: list[str] = []
+        tools: list[dict[str, Any]] = []
+        content = partial.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, Mapping):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text" and isinstance(block.get("text"), str):
+                    texts.append(block["text"])
+                elif block_type == "thinking" and isinstance(block.get("thinking"), str):
+                    thinking.append(block["thinking"])
+                elif block_type == "toolCall":
+                    tools.append(
+                        {
+                            "id": block.get("id")
+                            if isinstance(block.get("id"), str)
+                            else None,
+                            "title": block.get("name")
+                            if isinstance(block.get("name"), str)
+                            else None,
+                            "input": block.get("arguments"),
+                        }
+                    )
+        stream.text = "".join(texts)[:STREAM_MAX_CHARS]
+        stream.thinking = "".join(thinking)[:STREAM_MAX_CHARS]
+        if tools:
+            # partial 里有 toolCall 块时以它为准（会去重，和 toolcall_end 收集的合并）
+            known = {entry.get("id") for entry in stream.tools if entry.get("id")}
+            for tool in tools:
+                if tool.get("id") and tool["id"] in known:
+                    continue
+                stream.tools.append(tool)
+
+    def _push_live(
+        self,
+        session_id: str,
+        summary: PiSessionFile,
+        stream: LiveStream,
+        *,
+        force: bool = False,
+    ) -> None:
         now = time.monotonic()
-        if now - stream.last_push_at < STREAM_PUSH_MIN_INTERVAL_SECONDS:
+        if not force and now - stream.last_push_at < STREAM_PUSH_MIN_INTERVAL_SECONDS:
             return
         stream.last_push_at = now
-        stream.last_pushed_text = stream.text
         path = str(summary.path.resolve())
-        self._spawn(self.host.timeline_item_upsert(self._live_item(session_id, path, stream)))
+        for item in self._live_items(session_id, path, stream):
+            self._spawn(self.host.timeline_item_upsert(item))
+
+    def _live_items(
+        self,
+        session_id: str,
+        path: str,
+        stream: LiveStream,
+        base_order: int | None = None,
+    ) -> list[RuntimeTimelineItem]:
+        items: list[RuntimeTimelineItem] = []
+        order = base_order
+
+        def next_order() -> int:
+            nonlocal order
+            if order is None:
+                return self._next_order_seq(session_id)
+            order += 1
+            return order
+
+        if stream.thinking.strip():
+            items.append(
+                self._live_item(
+                    session_id,
+                    path,
+                    f"{stream.item_id}:thinking",
+                    item_type="system",
+                    role="assistant",
+                    content={
+                        "kind": "reasoning",
+                        "text": stream.thinking.strip(),
+                    },
+                    event="thinking_delta",
+                    order_seq=next_order(),
+                )
+            )
+        if stream.text.strip():
+            items.append(
+                self._live_item(
+                    session_id,
+                    path,
+                    stream.item_id,
+                    item_type="message",
+                    role="assistant",
+                    content={"kind": "text", "text": stream.text, "format": "text"},
+                    event="text_delta",
+                    order_seq=next_order(),
+                )
+            )
+        for index, tool in enumerate(stream.tools):
+            content: dict[str, Any] = {"kind": "tool_call"}
+            if tool.get("title"):
+                content["title"] = tool.get("title")
+            serialized = _serialize_tool_input(tool.get("input"))
+            if serialized:
+                content["input"] = serialized
+            items.append(
+                self._live_item(
+                    session_id,
+                    path,
+                    f"{stream.item_id}:tool:{index}",
+                    item_type="tool",
+                    role="assistant",
+                    content=content,
+                    event="toolcall_end",
+                    order_seq=next_order(),
+                )
+            )
+        if stream.error:
+            items.append(
+                self._live_item(
+                    session_id,
+                    path,
+                    f"{stream.item_id}:error",
+                    item_type="system",
+                    role="assistant",
+                    content={"kind": "error", "text": stream.error},
+                    event="error",
+                    status="failed",
+                    order_seq=next_order(),
+                )
+            )
+        return items
+
+    def _retry_item(
+        self,
+        session_id: str,
+        path: str,
+        order_seq: int,
+    ) -> RuntimeTimelineItem | None:
+        notice = self._retry_notices.get(session_id)
+        if not notice:
+            return None
+        return self._live_item(
+            session_id,
+            path,
+            f"pi:live:retry:{session_id[-8:]}",
+            item_type="system",
+            role="assistant",
+            content={"kind": "error", "text": notice},
+            event="auto_retry",
+            order_seq=order_seq,
+        )
 
     def _live_item(
         self,
         session_id: str,
         path: str,
-        stream: LiveStream,
-        order_seq: int | None = None,
+        item_id: str,
+        *,
+        item_type: str,
+        role: str,
+        content: dict[str, Any],
+        event: str,
+        status: str = "running",
+        order_seq: int,
     ) -> RuntimeTimelineItem:
-        content: dict[str, Any] = {"kind": "text", "text": stream.text, "format": "text"}
         return RuntimeTimelineItem(
-            id=stream.item_id,
+            id=item_id,
             session_id=session_id,
-            type="message",
-            status="running",
-            role="assistant",
+            type=item_type,
+            status=status,
+            role=role,
             content=content,
             source={
                 "runtime": "pi",
                 "sessionId": path,
-                "itemId": stream.item_id,
-                "itemType": "message",
-                "event": "message_update",
+                "itemId": item_id,
+                "itemType": item_type,
+                "event": event,
                 "runtimeId": self.config.runtime_id,
             },
-            order_seq=order_seq if order_seq is not None else self._next_order_seq(session_id),
+            order_seq=order_seq,
             content_hash=timeline_content_hash(
-                item_type="message",
-                status="running",
-                role="assistant",
+                item_type=item_type,  # type: ignore[arg-type]
+                status=status,  # type: ignore[arg-type]
+                role=role,  # type: ignore[arg-type]
                 content=content,
             ),
         )
@@ -1117,16 +1330,31 @@ class PiRuntime(AgentRuntime):
         snapshot: RuntimeTimelineSnapshot,
     ) -> RuntimeTimelineSnapshot:
         stream = self._streams.get(session_id)
-        if stream is None or not stream.text:
+        retry_notice = self._retry_notices.get(session_id)
+        if stream is None and not retry_notice:
             return snapshot
+        live: list[RuntimeTimelineItem] = []
         max_order = max((item.order_seq for item in snapshot.items), default=0)
-        live = self._live_item(
-            session_id,
-            snapshot.external_session_id or "",
-            stream,
-            order_seq=max_order + 1,
-        )
-        return replace(snapshot, items=(*snapshot.items, live))
+        if stream is not None:
+            items = self._live_items(
+                session_id,
+                snapshot.external_session_id or "",
+                stream,
+                base_order=max_order,
+            )
+            live.extend(items)
+            max_order = max((item.order_seq for item in items), default=max_order)
+        if retry_notice:
+            item = self._retry_item(
+                session_id,
+                snapshot.external_session_id or "",
+                max_order + 1,
+            )
+            if item is not None:
+                live.append(item)
+        if not live:
+            return snapshot
+        return replace(snapshot, items=(*snapshot.items, *live))
 
     async def _publish_timeline(self, session_id: str, summary: PiSessionFile) -> None:
         """RPC 回合事件到达时立刻推一次时间线，并发完就记下指纹避免重复推。"""
@@ -1164,6 +1392,30 @@ class PiRuntime(AgentRuntime):
         session_id = platform_session_id(self.host.connector_id, summary)
         if event_type in {"message_start", "message_update", "message_end"}:
             self._handle_message_event(session_id, summary, record)
+            return
+        if event_type == "auto_retry_start":
+            attempt = record.get("attempt")
+            max_attempts = record.get("maxAttempts")
+            reason = record.get("errorMessage")
+            detail = reason.strip() if isinstance(reason, str) and reason.strip() else "模型调用失败"
+            self._retry_notices[session_id] = (
+                f"{detail}（自动重试 {attempt}/{max_attempts}）"
+                if attempt and max_attempts
+                else detail
+            )
+            path = str(summary.path.resolve())
+            item = self._retry_item(
+                session_id,
+                path,
+                self._next_order_seq(session_id),
+            )
+            if item is not None:
+                self._spawn(self.host.timeline_item_upsert(item))
+            return
+        if event_type == "auto_retry_end":
+            if self._retry_notices.pop(session_id, None) is not None:
+                logger.info("pi auto retry finished session=%s success=%s", session_id, record.get("success"))
+                self._spawn(self._publish_timeline(session_id, summary))
             return
         if event_type == "agent_start":
             logger.info("pi event agent_start session=%s", session_id)

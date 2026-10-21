@@ -25,6 +25,7 @@ from connector.runtime_protocol import (
     MessageTimelineItem,
     ReasoningSystemContent,
     RuntimeTimelineItem,
+    SystemTimelineContent,
     SystemTimelineItem,
     TextMessageContent,
     TimelineSource,
@@ -445,6 +446,24 @@ def build_timeline(
             if isinstance(call_id, str):
                 tool_index[call_id] = len(items) - 1
         if not text.strip() and not thinking.strip() and not tool_calls:
+            error_message = message.get("errorMessage")
+            if isinstance(error_message, str) and error_message.strip():
+                # 失败回合 pi 只会存一条空正文 + stopReason=error，
+                # 以前这条被直接跳过，手机端就什么也看不到。
+                items.append(
+                    SystemTimelineItem(
+                        id=_item_id(entry, ":error"),
+                        type="system",
+                        status="failed",
+                        role="assistant",
+                        content=SystemTimelineContent(
+                            kind="error",
+                            text=_truncate(error_message.strip()),
+                        ),
+                        source=_source(external_id, entry, "error"),
+                        turn_id=turn_id,
+                    )
+                )
             # 纯系统/空消息：不产出一个空卡片。
             continue
 

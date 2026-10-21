@@ -749,3 +749,161 @@ def test_attachments_go_to_pi_images_and_files(tmp_path: Path, monkeypatch) -> N
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def _partial(*blocks: dict) -> dict:
+    return {"partial": {"role": "assistant", "content": list(blocks), "stopReason": "stop"}}
+
+
+def test_streaming_covers_thinking_tools_and_errors(tmp_path: Path) -> None:
+    """思考、工具调用要边跑边出卡片；失败回合要有可见报错。"""
+
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+        summary = runtime._resolve(sid, ext)
+
+        runtime._handle_event(summary, {"type": "message_start", "message": {"role": "assistant"}})
+        runtime._handle_event(
+            summary,
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "thinking_delta",
+                    **_partial({"type": "thinking", "thinking": "先看看代码"}),
+                },
+            },
+        )
+        runtime._handle_event(
+            summary,
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    **_partial(
+                        {"type": "thinking", "thinking": "先看看代码"},
+                        {"type": "text", "text": "我来读文件"},
+                        {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "a.py"}},
+                    ),
+                },
+            },
+        )
+        await asyncio.sleep(0.05)
+
+        kinds = {(item.type, item.content.get("kind")) for item in host.upserts}
+        assert ("system", "reasoning") in kinds, kinds
+        assert ("message", "text") in kinds, kinds
+        assert ("tool", "tool_call") in kinds, kinds
+
+        tool_item = next(item for item in host.upserts if item.type == "tool")
+        assert tool_item.content["title"] == "read"
+        assert "a.py" in tool_item.content["input"]
+
+        # 快照里也应带上这些临时卡片
+        snapshot = await runtime.get_session_snapshot(sid, ext)
+        live_ids = {item.id for item in host.upserts}
+        assert live_ids <= {item.id for item in snapshot.items}
+
+        # 失败事件 → 立刻推一条 error 气泡
+        runtime._handle_event(summary, {"type": "message_start", "message": {"role": "assistant"}})
+        runtime._handle_event(
+            summary,
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "error",
+                    "reason": "error",
+                    "error": {"role": "assistant", "content": [], "errorMessage": "401 invalid api key"},
+                },
+            },
+        )
+        await asyncio.sleep(0.05)
+        errors = [item for item in host.upserts if item.content.get("kind") == "error"]
+        assert errors and "401" in errors[0].content["text"]
+
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_auto_retry_notice_visible(tmp_path: Path) -> None:
+    async def run() -> None:
+        write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+        summary = runtime._resolve(sid, ext)
+
+        runtime._handle_event(
+            summary,
+            {
+                "type": "auto_retry_start",
+                "attempt": 2,
+                "maxAttempts": 5,
+                "delayMs": 800,
+                "errorMessage": "503 service unavailable",
+            },
+        )
+        await asyncio.sleep(0.05)
+        notices = [item for item in host.upserts if item.content.get("kind") == "error"]
+        assert notices and "503" in notices[0].content["text"] and "2/5" in notices[0].content["text"]
+
+        snapshot = await runtime.get_session_snapshot(sid, ext)
+        assert any(item.content.get("kind") == "error" for item in snapshot.items)
+
+        runtime._handle_event(summary, {"type": "auto_retry_end", "success": True, "attempt": 2})
+        await asyncio.sleep(0.05)
+        assert sid not in runtime._retry_notices
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_failed_assistant_message_projects_error_item(tmp_path: Path) -> None:
+    """JSONL 里 stopReason=error + 空正文时，不能什么都不显示。"""
+
+    async def run() -> None:
+        base = session_entries()
+        entries = [
+            *base,
+            {
+                "type": "message",
+                "id": "err1",
+                "parentId": "a1",
+                "timestamp": "2026-01-01T00:00:20.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [],
+                    "stopReason": "error",
+                    "errorMessage": "Provider returned 429 Too Many Requests",
+                },
+            },
+        ]
+        write_session(tmp_path, "one", entries)
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        runtime = await provider.create_runtime(config, FakeHost())
+        listed = await runtime.list_sessions(limit=10, force=True)
+        snapshot = await runtime.get_session_snapshot(
+            listed[0].session_id, listed[0].external_session_id
+        )
+        errors = [item for item in snapshot.items if item.content.get("kind") == "error"]
+        assert errors and "429" in errors[0].content["text"]
+        assert errors[0].status == "failed"
+        await runtime.stop()
+
+    asyncio.run(run())
