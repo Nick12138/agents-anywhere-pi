@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from connector.runtime_protocol import RuntimeModelCatalog, RuntimeModelItem
 from connector.runtimes.pi import sessions
 from connector.runtimes.pi.provider import PiProvider
 
@@ -113,6 +114,12 @@ def test_current_branch_ignores_abandoned_sibling(tmp_path: Path) -> None:
 class FakeHost:
     connector_id = "conn_test"
 
+    def __init__(self) -> None:
+        self.catalogs = []
+
+    async def model_catalog_update(self, catalog) -> None:
+        self.catalogs.append(catalog)
+
     async def session_state_update(self, *args, **kwargs) -> None:
         return None
 
@@ -137,6 +144,47 @@ def test_provider_config_and_snapshot(tmp_path: Path) -> None:
         snapshot = await runtime.get_session_snapshot(listed[0].session_id, listed[0].external_session_id)
         assert snapshot.complete is True
         assert len(snapshot.items) == 4
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_model_catalog_is_published_with_runtime_id(tmp_path: Path) -> None:
+    async def run() -> None:
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        models = (
+            RuntimeModelItem(
+                id="2/gpt-6-luna",
+                title="NingYi / gpt-6-luna",
+                selection_id="model:2/gpt-6-luna",
+                description="2 · gpt-6-luna",
+                reasoning_items=(),
+                metadata={"provider": "2"},
+            ),
+        )
+
+        async def load() -> RuntimeModelCatalog:
+            return RuntimeModelCatalog(
+                runtime="pi",
+                runtime_id=config.runtime_id,
+                revision=1,
+                models=models,
+            )
+
+        runtime._load_model_catalog = load  # type: ignore[method-assign]
+        catalog = await runtime.list_model_catalog(limit=10)
+        assert catalog.revision == host.catalogs[-1].revision
+        assert catalog.revision > 1
+        assert host.catalogs[-1].runtime_id == config.runtime_id
+        assert [item.id for item in host.catalogs[-1].models] == ["2/gpt-6-luna"]
+        # 内容没变不重复上报
+        await runtime.list_model_catalog(limit=10)
+        assert len(host.catalogs) == 1
         await runtime.stop()
 
     asyncio.run(run())

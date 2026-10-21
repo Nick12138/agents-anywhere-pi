@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,9 @@ class PiRuntime(AgentRuntime):
         self._notices: dict[str, dict[str, PendingInteraction]] = {}
         self._snapshot_cache: dict[str, tuple[int, int, RuntimeTimelineSnapshot]] = {}
         self._catalog: tuple[float, tuple[int, int] | None, RuntimeModelCatalog] | None = None
+        # 时间戳起点：进程重启后 revision 仍单调递增，避免服务端判成冲突。
+        self._catalog_revision = int(time.time() * 1000)
+        self._catalog_key: tuple[tuple[str, ...], ...] | None = None
         self._closed = False
 
     @property
@@ -123,7 +127,11 @@ class PiRuntime(AgentRuntime):
         return float(value) / 1000.0 if isinstance(value, int) and value > 0 else 30.0
 
     async def start(self) -> None:
-        return None
+        # 启动时先取一次目录并上报，服务端会话快照才有模型可选。
+        try:
+            await self.list_model_catalog()
+        except Exception:  # 目录失败不能阻止 runtime 启动
+            logger.warning("pi runtime start: model catalog unavailable", exc_info=True)
 
     async def stop(self) -> None:
         self._closed = True
@@ -322,7 +330,8 @@ class PiRuntime(AgentRuntime):
             catalog = self._catalog[2]
         else:
             catalog = await self._load_model_catalog()
-            self._catalog = (now, signature, catalog)
+        catalog = await self._publish_catalog(catalog)
+        self._catalog = (now, signature, catalog)
         models = catalog.models
         if query:
             needle = query.casefold()
@@ -370,7 +379,31 @@ class PiRuntime(AgentRuntime):
             raw_models if isinstance(raw_models, list) else [],
             read_model_config(self._agent_dir()),
         )
-        return RuntimeModelCatalog(runtime="pi", revision=1, models=models)
+        return RuntimeModelCatalog(
+            runtime="pi",
+            runtime_id=self.config.runtime_id,
+            revision=max(1, self._catalog_revision),
+            models=models,
+        )
+
+    async def _publish_catalog(self, catalog: RuntimeModelCatalog) -> RuntimeModelCatalog:
+        """内容变化时上报 `runtime.catalog.updated`，否则会话快照里没有模型。"""
+
+        key: tuple[tuple[str, ...], ...] = tuple(
+            (model.id, model.title, model.description or "", model.selection_id or "")
+            for model in catalog.models
+        )
+        if key == self._catalog_key:
+            return replace(catalog, revision=max(1, self._catalog_revision))
+        self._catalog_revision += 1
+        published = replace(catalog, revision=self._catalog_revision)
+        try:
+            await self.host.model_catalog_update(published)
+        except Exception:  # 上报失败下次再试
+            logger.warning("failed to publish pi model catalog", exc_info=True)
+            return published
+        self._catalog_key = key
+        return published
 
     # ---- turns ----
 
