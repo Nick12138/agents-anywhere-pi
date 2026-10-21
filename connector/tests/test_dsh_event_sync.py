@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from connector.runtime_protocol import (
+    RuntimeInstanceHost,
+    RuntimeInstanceSpec,
+    timeline_content_hash,
+)
+from connector.runtimes.dsh.bridge.host import (
+    SnapshotPage,
+    SnapshotRequest,
+    SubscriptionRegistry,
+    SyncBatch,
+)
+from connector.runtimes.dsh.bridge.sync import SyncRelay
+from connector.runtimes.dsh.runtime import DshRuntime
+from connector.server.runtime_host import ConnectorRuntimeHost
+from connector.server.runtime_sync import RuntimeSyncRunner
+from tests.dsh_sync_helpers import add_page, begin_snapshot, ingest, ready_relay
+
+
+def item(item_id="one", session_id="session"):
+    content = {"text": "hello", "format": "markdown"}
+    return {"id": item_id, "sessionId": session_id, "type": "message", "role": "assistant",
+            "status": "done", "orderSeq": 1, "revision": 1, "content": content,
+            "source": {"runtime": "dsh"},
+            "contentHash": timeline_content_hash("message", "done", "assistant", content)}
+
+
+def host():
+    receiver = SimpleNamespace(publish_runtime_notifications=AsyncMock(), sync_state_write=AsyncMock(), runtime_health_update=AsyncMock())
+    async def snapshot(runtime, session_id, meta, items, **kwargs):
+        await receiver.publish_runtime_notifications(runtime, [
+            {"method": "session.meta.upsert", "params": {"sessionId": session_id, **meta}},
+            {"method": "timeline.sync", "params": {"sessionId": session_id, "externalSessionId": meta["externalSessionId"], "items": list(items), "complete": True}},
+        ], **kwargs)
+    receiver.publish_runtime_snapshot = snapshot
+    return receiver
+
+
+def test_snapshot_replacement_waits_for_complete_capture_and_preserves_empty_snapshot():
+    async def exercise():
+        receiver = host()
+        relay = ready_relay(receiver)
+        try:
+            await begin_snapshot(relay, session_id="session", through_seq=12,
+                meta={"externalSessionId": "native", "cwd": "/repo"})
+            await add_page(relay, [item()])
+            # Streamed pages are buffered; nothing replaces the previous history before commit.
+            receiver.publish_runtime_notifications.assert_not_awaited()
+            await add_page(relay, [item("two")])
+            receiver.publish_runtime_notifications.assert_not_awaited()
+            result = await relay.commit_snapshot()
+            assert result.accepted is True
+            notices = receiver.publish_runtime_notifications.call_args.args[1]
+            assert [n["method"] for n in notices] == ["session.meta.upsert", "timeline.sync"]
+            assert notices[1]["params"]["complete"] is True
+            assert [i["id"] for i in notices[1]["params"]["items"]] == ["one", "two"]
+            await begin_snapshot(relay, session_id="session", through_seq=0, meta={"externalSessionId": "native"})
+            await relay.commit_snapshot()
+            assert receiver.publish_runtime_notifications.call_args.args[1][1]["params"]["items"] == []
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
+def test_snapshot_abort_foreign_items_and_duplicate_pages_do_not_publish_partial_history():
+    async def exercise():
+        receiver = host()
+        relay = ready_relay(receiver)
+        try:
+            await begin_snapshot(relay, session_id="session", through_seq=1, meta={"externalSessionId": "native"})
+            with pytest.raises(ValueError, match="identity"):
+                await add_page(relay, [item(session_id="other")])
+            await add_page(relay, [item()])
+            with pytest.raises(ValueError, match="identity"):
+                await add_page(relay, [item()])
+            await relay.abort_snapshot()
+            assert relay.file is None and relay.snapshot is None
+            assert relay.items == [] and relay.item_ids == set()
+            receiver.publish_runtime_notifications.assert_not_awaited()
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.parametrize("projection_version", [2, 3])
+def test_relay_failure_resubscribes_without_closing_concurrent_rpc(reject, projection_version):
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        stream_failed, resubscribed = asyncio.Event(), asyncio.Event()
+        acks = []
+        streams = 0
+        deliveries = 0
+
+        async def publish(*args, **kwargs):
+            nonlocal deliveries
+            assert kwargs["session_id"] == "session" and kwargs["runtime"] == "dsh"
+            entered.set()
+            await release.wait()
+            deliveries += 1
+            if reject and deliveries == 1:
+                raise RuntimeError("delivery failed")
+
+        async def stream(method, params=None):
+            nonlocal streams
+            assert method == "sync"
+            streams += 1
+            if streams == 1:
+                yield {"kind": "subscribed", "projectionVersion": projection_version}
+                await stream_failed.wait()
+                raise RuntimeError("sync stream interrupted")
+            resubscribed.set()
+            yield {"kind": "subscribed", "projectionVersion": projection_version}
+            await asyncio.Event().wait()  # keep the replacement feed open
+
+        registry = SubscriptionRegistry()
+        client = SimpleNamespace(stream=stream, connected=True, host=SimpleNamespace(registry=registry))
+        relay = SyncRelay(client, SimpleNamespace(session_state_update=publish, runtime_health_update=AsyncMock()), retry_delay=0.01)
+        relay.start()
+        op = {"kind": "notifications", "notifications": [{"method": "session.state.updated", "params": {"sessionId": "session", "status": "idle"}}]}
+
+        async def deliver():
+            await ingest(relay, op)
+            acks.append(relay.expected_batch - 1)
+
+        try:
+            await asyncio.wait_for(relay.confirmed.wait(), 1)
+            first = relay.subscription_id
+            batch = asyncio.create_task(deliver())
+            await asyncio.wait_for(entered.wait(), 1)
+            # The batch is only acknowledged after delivery completed.
+            assert not batch.done() and acks == []
+            release.set()
+            if reject:
+                with pytest.raises(RuntimeError, match="delivery failed"):
+                    await batch
+                assert acks == []
+            else:
+                await batch
+                assert acks == [1]
+            stream_failed.set()
+            await asyncio.wait_for(resubscribed.wait(), 1)
+            # A batch delayed on the old subscription cannot touch the new feed.
+            with pytest.raises(ValueError, match="already ended"):
+                await relay.ingest(SyncBatch(
+                    subscriptionId=first or "", batchSeq=1,
+                    projectionVersion=projection_version, operations=[op],
+                ))
+            await deliver()
+            assert acks == ([1] if reject else [1, 1])
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
+def test_replayed_batch_after_a_lost_acknowledgement_is_idempotent():
+    async def exercise():
+        relay = ready_relay(host())
+        try:
+            replay = SyncBatch(subscriptionId="sub", batchSeq=1, projectionVersion=3,
+                               operations=[{"kind": "workspace.inventory"}])
+            await relay.ingest(replay)
+            assert relay.expected_batch == 2
+            # The Router may redeliver a batch whose acknowledgement was lost;
+            # the original application already advanced the sequence.
+            await relay.ingest(replay)
+            assert relay.expected_batch == 2
+            with pytest.raises(ValueError, match="Out-of-order"):
+                await relay.ingest(SyncBatch(subscriptionId="sub", batchSeq=3, projectionVersion=3,
+                                             operations=[{"kind": "workspace.inventory"}]))
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
+def test_event_runtime_is_not_scanned_and_reconnect_is_explicit():
+    async def exercise():
+        runtime = SimpleNamespace(sync_mode="events", resynchronize=AsyncMock())
+        supervisor = SimpleNamespace(runtimes={"dsh": runtime}, resolve_runtime=lambda _: runtime,
+                                     entry=Mock(side_effect=AssertionError("scanner inspected event runtime")))
+        runner = RuntimeSyncRunner(None, supervisor, host(), dict, AsyncMock())
+        await runner.sync_existing_once()
+        await runner.sync_existing_once()
+        runtime.resynchronize.assert_not_awaited()
+        await runner.reconnect_event_runtimes()
+        runtime.resynchronize.assert_awaited_once_with()
+    asyncio.run(exercise())
+
+
+def test_instance_binds_existing_notifications_and_propagates_ingest_failure():
+    async def exercise():
+        ingest, background = AsyncMock(), AsyncMock()
+        base = ConnectorRuntimeHost("connector", background, AsyncMock(), ingest_notifications=ingest)
+        scoped = RuntimeInstanceHost(base, RuntimeInstanceSpec(runtime_id="rti_phone", runtime_type="dsh", name="DSH"))
+        notices = [{"method": "timeline.itemUpsert", "params": {
+            "runtime": "foreign", "runtimeId": "foreign", "sessionId": "session", "item": item()}}]
+        await scoped.publish_runtime_notifications("dsh", notices)
+        params = ingest.call_args.args[0][0]["params"]
+        assert params["runtime"] == "dsh" and params["runtimeId"] == "rti_phone"
+        background.assert_not_awaited()
+        ingest.side_effect = RuntimeError("offline")
+        with pytest.raises(RuntimeError, match="offline"):
+            await scoped.publish_runtime_notifications("dsh", notices)
+        with pytest.raises(ValueError):
+            await base.publish_runtime_notifications("dsh", [{"method": "unknown", "params": {}}])
+    asyncio.run(exercise())
+
+
+def test_legacy_workspace_inventory_does_not_write_projects_or_local_state():
+    async def exercise():
+        ingest = AsyncMock()
+        base = ConnectorRuntimeHost("device", AsyncMock(), AsyncMock(), ingest_notifications=ingest)
+        host = RuntimeInstanceHost(base, RuntimeInstanceSpec(runtime_id="rti_dsh", runtime_type="dsh", name="DSH"))
+        relay = SyncRelay(Mock(), host)
+        base.sync_state_write = AsyncMock()
+        projects = [{"id": "native", "title": "DSH name", "path": "/repo", "sessionIds": ["session"]}]
+        await relay.operation({"kind": "workspace.inventory", "complete": True, "workspaces": projects})
+        ingest.assert_not_awaited()
+        base.sync_state_write.assert_not_awaited()
+    asyncio.run(exercise())
+
+
+def test_fresh_source_state_waits_for_ingestion_and_archive_send_returns_standard_error(tmp_path):
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def publish(*args):
+            entered.set()
+            await release.wait()
+        runtime = DshRuntime(
+            SimpleNamespace(values={"dshHome": str(tmp_path)}),
+            SimpleNamespace(publish_runtime_notifications=publish),
+        )
+        source = {"availability": "archived", "reason": "archived_in_dsh", "observedAt": "2026-09-07T00:00:00Z"}
+        runtime._request = AsyncMock(return_value={"runtime": "dsh", "sessionId": "session", "externalSessionId": "native",
+            "status": "blocked", "selections": {}, "sourceState": source})
+        task = asyncio.create_task(runtime.get_session_state("session", "native"))
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not task.done()
+        release.set()
+        assert (await task).status == "blocked"
+        runtime._request.return_value = {"ok": False, "code": "session_archived", "message": "Archived in DSH",
+            "result": {"sessionId": "session", "externalSessionId": "native", "sourceState": source}}
+        result = await runtime.start_turn("session", "native", "hi", client_message_id="request")
+        assert result.ok is False and result.code == "session_archived"
+        assert result.result["sourceState"] == source
+    asyncio.run(exercise())
+
+
+def test_dsh_question_batches_use_existing_publishers_in_order_with_instance_binding():
+    async def exercise():
+        forwarded = []
+
+        async def notify(method, params):
+            forwarded.append({"method": method, "params": params})
+
+        async def ingest(notifications):
+            forwarded.extend(notifications)
+
+        base = ConnectorRuntimeHost("connector", notify, AsyncMock(), ingest_notifications=ingest)
+        scoped = RuntimeInstanceHost(base, RuntimeInstanceSpec(runtime_id="rti_phone", runtime_type="dsh", name="DSH"))
+        relay = SyncRelay(Mock(), scoped)
+        await relay.operation({"kind": "notifications", "notifications": [
+            {"method": "timeline.itemUpsert", "params": {"sessionId": "session", "item": item()}},
+            {"method": "notice.upsert", "params": {"noticeId": "q", "sessionId": "session", "runtime": "dsh",
+                "type": "interaction", "interactionType": "input_request", "title": "回答问题", "status": "open",
+                "responseRequired": True, "blocking": {"scope": "session", "targetId": "session"}}},
+            {"method": "runtime.capability.updated", "params": {"runtime": "dsh", "revision": 2,
+                "capabilities": [{"capabilityId": "session.interaction.approval", "scope": "runtime", "supported": True}]}},
+            {"method": "session.state.updated", "params": {"sessionId": "session", "status": "waiting_approval"}},
+        ]})
+        assert [n["method"] for n in forwarded] == ["timeline.itemUpsert", "notice.upsert", "runtime.capability.updated", "session.state.updated"]
+        assert forwarded[0]["params"]["runtimeId"] == "rti_phone"
+        assert forwarded[1]["params"]["source"]["runtimeId"] == "rti_phone"
+        assert forwarded[1]["params"]["blocking"]["targetId"] == "session"
+        assert forwarded[2]["params"]["capabilities"][0]["runtimeId"] == "rti_phone"
+    asyncio.run(exercise())
+
+
+def test_snapshot_buffer_reuses_small_objects_and_spills_large_captures_without_jsonl():
+    async def exercise():
+        relay = SyncRelay(Mock(), host())
+        try:
+            small = item()
+            await relay.store_items([small])
+            assert relay.file is None
+            assert next(iter(relay.iter_items())) is small
+            large = {"payload": "x" * (9 * 1024 * 1024)}
+            await relay.store_items([large])
+            assert relay.file is not None
+            assert relay.items == []
+            assert list(relay.iter_items()) == [small, large]
+            relay.clear_snapshot()
+            assert relay.file is None
+            assert relay.items == []
+            assert relay.item_bytes == 0
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
+def test_runtime_is_healthy_only_after_inventory_is_delivered():
+    async def run():
+        receiver = host()
+        relay = SyncRelay(Mock(), receiver)
+        await relay.publish_notification({"method": "session.inventory.begin", "params": {"scanToken": "scan"}})
+        receiver.runtime_health_update.assert_not_awaited()
+        receiver.publish_runtime_notifications.side_effect = RuntimeError("ingest unavailable")
+        complete = {"method": "session.inventory.complete", "params": {"scanToken": "scan", "complete": True, "sessions": []}}
+        with pytest.raises(RuntimeError):
+            await relay.publish_notification(complete)
+        receiver.runtime_health_update.assert_not_awaited()
+        receiver.publish_runtime_notifications.side_effect = None
+        await relay.publish_notification(complete)
+        receiver.runtime_health_update.assert_awaited_once_with("running")
+    asyncio.run(run())
+
+
+def test_inventory_does_not_report_healthy_while_delivery_is_pending_or_incomplete():
+    async def run():
+        receiver = host()
+        relay = SyncRelay(Mock(), receiver)
+        await relay.publish_notification({"method": "session.inventory.complete", "params": {"complete": False}})
+        receiver.runtime_health_update.assert_not_awaited()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def deliver(*args):
+            entered.set()
+            await release.wait()
+
+        receiver.publish_runtime_notifications.side_effect = deliver
+        task = asyncio.create_task(relay.publish_notification({
+            "method": "session.inventory.complete", "params": {"complete": True, "sessions": []},
+        }))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            receiver.runtime_health_update.assert_not_awaited()
+            release.set()
+            await asyncio.wait_for(task, 1)
+            receiver.runtime_health_update.assert_awaited_once_with("running")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await relay.close()
+    asyncio.run(run())
+
+
+def test_snapshot_pages_and_aborts_from_another_capture_are_ignored():
+    async def exercise():
+        receiver = host()
+        relay = ready_relay(receiver)
+        await relay.begin_snapshot(SnapshotRequest(
+            captureId="new", subscriptionId="sub", sessionId="session",
+            meta={"externalSessionId": "native"}, throughSeq=3,
+        ))
+        with pytest.raises(ValueError, match="capture"):
+            await relay.add_snapshot_page(SnapshotPage(captureId="old", items=[item()]))
+        # A cancelled stream from the previous capture must not clear the new one.
+        await relay.abort_snapshot("old")
+        assert relay.snapshot is not None
+        assert relay.snapshot["captureId"] == "new"
+        with pytest.raises(ValueError, match="capture"):
+            await relay.commit_snapshot("old")
+        await relay.add_snapshot_page(SnapshotPage(captureId="new", items=[item()]))
+        result = await relay.commit_snapshot("new")
+        assert result.accepted is True
+        assert [n["method"] for n in receiver.publish_runtime_notifications.call_args.args[1]] == [
+            "session.meta.upsert", "timeline.sync",
+        ]
+
+    asyncio.run(exercise())

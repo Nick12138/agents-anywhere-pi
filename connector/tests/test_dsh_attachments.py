@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+
+import pytest
+
+from connector.runtime_protocol import (
+    RuntimeAttachment,
+    RuntimeAttachmentContent,
+    RuntimeConfig,
+    RuntimeInvalidRequestError,
+)
+from connector.runtimes.dsh import provider_config
+from connector.runtimes.dsh.attachments import staged_attachments
+from connector.runtimes.dsh.runtime import DshRuntime
+
+
+class Host:
+    def __init__(self, content=b"image", fail_on=None, media_type="image/png"):
+        self.media_type = media_type
+        self.content = content
+        self.fail_on = fail_on
+        self.downloads = []
+
+    async def attachment_download(self, session_id, file_id):
+        self.downloads.append((session_id, file_id))
+        if file_id == self.fail_on:
+            raise OSError("download failed")
+        return RuntimeAttachmentContent(file_id, "attachment", self.media_type, self.content)
+
+
+def image(file_id="file_image", content=b"image"):
+    return RuntimeAttachment(file_id, "image.png", "image/png", len(content), hashlib.sha256(content).hexdigest())
+
+
+@pytest.mark.parametrize("mime", ["image/png", "application/pdf", "text/plain", "application/octet-stream", "image/svg+xml"])
+def test_attachments_stage_without_bytes_in_rpc(tmp_path, mime):
+    async def run():
+        host = Host(media_type=mime)
+        attachment = RuntimeAttachment("file_upload", "attachment", mime, 5, hashlib.sha256(b"image").hexdigest())
+        async with staged_attachments(host, "session", (attachment,), tmp_path) as refs:
+            assert refs[0]["fileId"] == "file_upload"
+            assert refs[0]["mediaType"] == mime
+            path = tmp_path / "attachments/staging" / refs[0]["uploadId"]
+            assert path.read_bytes() == b"image"
+            assert "contentBase64" not in refs[0] and "path" not in refs[0]
+        assert not path.exists()
+    asyncio.run(run())
+
+
+def test_failed_batch_and_checksum_mismatch_clean_up(tmp_path):
+    async def run():
+        host = Host(fail_on="file_second")
+        with pytest.raises(OSError, match="download failed"):
+            async with staged_attachments(host, "session", (image(), image("file_second")), tmp_path):
+                pytest.fail("partial batches must not be submitted")
+        assert list((tmp_path / "attachments/staging").iterdir()) == []
+        with pytest.raises(RuntimeInvalidRequestError, match="content does not match"):
+            async with staged_attachments(Host(b"other"), "session", (image(),), tmp_path):
+                pytest.fail("corrupt download must be refused")
+    asyncio.run(run())
+
+
+def test_image_only_turn_keeps_large_bytes_out_of_rpc_and_cleans_up(tmp_path):
+    content = b"x" * (9 * 1024 * 1024)
+
+    class Runtime(DshRuntime):
+        async def _request(self, method, params=None):
+            if method == "getRuntimeCapabilities":
+                return {"capabilities": [{"capabilityId": "runtime.attachment", "supported": True, "available": True, "allowed": True}]}
+            assert method == "startTurn" and params["content"] == ""
+            reference = params["attachments"][0]
+            path = provider_config.bridge_directory() / "attachments/staging" / reference["uploadId"]
+            assert path.read_bytes() == content
+            assert len(str(params)) < 1024
+            return {"accepted": True}
+
+    async def run():
+        runtime = Runtime(RuntimeConfig("dsh", 1, {"dshHome": str(tmp_path)}), Host(content))
+        result = await runtime.start_turn("session", "native", "", attachments=(image(content=content),), client_message_id="message")
+        assert result.ok
+        assert list((provider_config.bridge_directory() / "attachments/staging").iterdir()) == []
+    asyncio.run(run())
+
+
+def test_attachments_are_staged_under_the_bridge_rendezvous_not_dsh_home(tmp_path):
+    content = b"rendezvous"
+    dsh_home = tmp_path / "dsh-home"
+
+    class Runtime(DshRuntime):
+        async def _request(self, method, params=None):
+            if method == "getRuntimeCapabilities":
+                return {"capabilities": [{"capabilityId": "runtime.attachment", "supported": True, "available": True, "allowed": True}]}
+            assert method == "startTurn"
+            path = provider_config.bridge_directory() / "attachments/staging" / params["attachments"][0]["uploadId"]
+            assert path.read_bytes() == content
+            # Staging is shared through the Router rendezvous, so it does not
+            # move with DSH_HOME (and is not derived from a 1.x endpoint file).
+            assert path.parent.parent == provider_config.endpoint_path().parent / "attachments"
+            assert not path.is_relative_to(dsh_home)
+            return {"accepted": True}
+
+    async def run():
+        runtime = Runtime(RuntimeConfig("dsh", 1, {"dshHome": str(dsh_home)}), Host(content))
+        result = await runtime.start_turn("session", "native", "", attachments=(image(content=content),), client_message_id="message")
+        assert result.ok
+    asyncio.run(run())

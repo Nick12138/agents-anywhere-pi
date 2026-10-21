@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+
+import httpx
+
+from connector.core.config import ConnectorConfig
+from connector.core.runtime_owner import (
+    RuntimeLease,
+)
+from connector.logging import configure_connector_logging, logger
+from connector.mesh.host import serve_host
+from connector.server.client import BackendRpcClient
+from connector.server.pairing import (
+    poll_pairing,
+    resolve_pair_server_url,
+    start_pairing,
+)
+
+SHELL_LIFETIME_WARNING = (
+    "Note: this connector runs in the current shell session. "
+    "If you do not run it with a tool such as systemd, tmux, screen, "
+    "or a background service, the connection will stop when this shell session ends."
+)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    configure_connector_logging(debug=bool(getattr(args, "debug", False)))
+    try:
+        if args.command in {"pair", "login"}:
+            asyncio.run(_pair(args))
+        elif args.command == "configure":
+            _configure(args)
+        elif args.command == "start":
+            asyncio.run(_start(args))
+        elif args.command == "rpc":
+            asyncio.run(_rpc(args))
+        else:
+            parser.print_help()
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except httpx.TimeoutException as exc:
+        print(
+            f"error: request timed out: {exc.request.url if exc.request else exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
+    except httpx.HTTPStatusError as exc:
+        detail = _response_detail(exc.response)
+        print(
+            f"error: server returned HTTP {exc.response.status_code}: {detail}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
+    except httpx.RequestError as exc:
+        print(f"error: cannot reach server: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except (TimeoutError, RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+
+
+class CliError(RuntimeError):
+    pass
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="anywhere-cli", description="Agent Server Codex connector CLI"
+    )
+    subparsers = parser.add_subparsers(
+        dest="command", metavar="{start,pair,configure,rpc}"
+    )
+
+    start = subparsers.add_parser("start", help="start the connector")
+    _add_config_args(start)
+    start.add_argument("--server-url", help="backend server URL")
+    start.add_argument("--connector-id", help="connector id")
+    start.add_argument("--connector-token", help="connector token")
+    _add_debug_arg(start)
+
+    pair = subparsers.add_parser(
+        "pair",
+        help="pair with a backend, save credentials, and start the connector",
+    )
+    _add_pair_args(pair)
+
+    configure = subparsers.add_parser(
+        "configure", help="save connector credentials to local JSON"
+    )
+    _add_config_args(configure)
+    configure.add_argument("--server-url", required=True, help="backend server URL")
+    configure.add_argument("--connector-id", required=True, help="connector id")
+    configure.add_argument("--connector-token", required=True, help="connector token")
+
+    rpc = subparsers.add_parser(
+        "rpc", help="serve the local control API (MeshCall) for the desktop app and plugins"
+    )
+    _add_config_args(rpc)
+    _add_debug_arg(rpc)
+    return parser
+
+
+def _add_config_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        default=str(ConnectorConfig.default_path()),
+        help="local connector config JSON path",
+    )
+
+
+def _add_debug_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="show debug-level connector logs",
+    )
+
+
+def _add_pair_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    _add_debug_arg(parser)
+    parser.add_argument(
+        "server",
+        nargs="?",
+        help="backend server URL, for example anywhere.com or https://api.anywhere.com",
+    )
+    parser.add_argument(
+        "--poll-interval", type=float, default=2, help="seconds between pairing polls"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=600, help="pairing timeout in seconds"
+    )
+    parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="save credentials without starting the connector",
+    )
+
+
+async def _start(args: argparse.Namespace) -> None:
+    config = _resolve_config(args)
+    await _run_cli_connector(config, config_path=args.config)
+
+
+async def _rpc(args: argparse.Namespace) -> None:
+    await serve_host(config_path=args.config, debug=args.debug)
+
+
+async def _pair(args: argparse.Namespace) -> None:
+    lease = RuntimeLease(legacy_paths=[Path(args.config).with_name("connector-runtime.json")])
+    if not args.no_start:
+        lease.claim()
+    try:
+        await _pair_with_lease(args, lease)
+    finally:
+        if not args.no_start:
+            lease.release()
+
+
+async def _pair_with_lease(args: argparse.Namespace, lease: RuntimeLease) -> None:
+    server_url = await _resolve_server_url_for_pair(args.server, timeout=10)
+    async with httpx.AsyncClient(timeout=30) as client:
+        pairing = await start_pairing(client, server_url, args.timeout)
+        pairing_id = pairing["pairingId"]
+        code = pairing["code"]
+
+        print(f"Pairing code: {code}")
+        print("Claim it from the web UI")
+        # print(
+        #     "curl -s "
+        #     f"{api_v2_url(server_url, '/pairing/claim')} "
+        #     "-H 'content-type: application/json' "
+        #     f"-d '{{\"code\":\"{code}\",\"name\":\"local-codex\",\"userId\":\"local\",\"serverUrl\":\"{server_url}\"}}'"
+        # )
+        print("Waiting for credentials...")
+
+        deadline = time.monotonic() + args.timeout
+        while time.monotonic() < deadline:
+            payload = await poll_pairing(client, server_url, str(pairing_id))
+            if payload["status"] == "claimed" and payload.get("config"):
+                config = ConnectorConfig.from_mapping(payload["config"])
+                path = config.save(args.config)
+                print(f"Saved connector config: {path}")
+                if args.no_start:
+                    return
+                print("Starting connector...")
+                await _run_cli_connector(config, config_path=args.config, lease=lease)
+                return
+            if payload["status"] in {"expired", "consumed"}:
+                raise RuntimeError(f"pairing ended with status: {payload['status']}")
+            await asyncio.sleep(args.poll_interval)
+
+    raise TimeoutError("pairing timed out")
+
+
+async def _run_cli_connector(
+    config: ConnectorConfig, *, config_path: str | Path | None, lease: RuntimeLease | None = None
+) -> None:
+    lease = lease or RuntimeLease(legacy_paths=[Path(config_path).with_name("connector-runtime.json")] if config_path else [])
+    lease.claim(config)
+    try:
+        from connector.core import runtime_owner
+        from connector.logging import install_rpc_log_sink
+        from connector.mesh.hub import LocalHub, set_local_hub
+        from connector.mesh.logs import LogsService, open_log_hub
+
+        logs = open_log_hub(runtime_owner.system_home() / ".agents-anywhere" / "logs")
+        sink = install_rpc_log_sink(logs.notify)
+        hub = LocalHub()
+        set_local_hub(hub)
+        print(SHELL_LIFETIME_WARNING)
+        try:
+            try:
+                await hub.start()
+                await hub.mount(LogsService(logs))
+            except Exception as error:  # noqa: BLE001 - runtime logging is auxiliary
+                # The Router is also how DSH reaches this Connector, so a failure
+                # only degrades DSH; Codex/Claude sessions keep running.
+                logger.warning(
+                    "local control router unavailable; continuing without the log service error_type={} error={}",
+                    type(error).__name__, error,
+                )
+            await BackendRpcClient(config).run_forever()
+        finally:
+            try:
+                await hub.stop()
+            finally:
+                set_local_hub(None)
+                await sink.close()
+                logs.close()
+    finally:
+        lease.release()
+
+
+async def _resolve_server_url_for_pair(
+    value: str | None, *, timeout: float = 10
+) -> str:
+    try:
+        return await resolve_pair_server_url(
+            value,
+            timeout=timeout,
+            missing_message="missing server address. Usage: anywhere-cli pair <server>",
+        )
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+
+
+def _configure(args: argparse.Namespace) -> None:
+    config = ConnectorConfig(
+        server_url=args.server_url.rstrip("/"),
+        connector_id=args.connector_id,
+        connector_token=args.connector_token,
+    )
+    path = config.save(args.config)
+    print(f"Saved connector config: {path}")
+
+
+def _resolve_config(args: argparse.Namespace) -> ConnectorConfig:
+    server_url = args.server_url or os.environ.get("AGENT_SERVER_URL")
+    connector_id = args.connector_id or os.environ.get("AGENT_CONNECTOR_ID")
+    connector_token = args.connector_token or os.environ.get("AGENT_CONNECTOR_TOKEN")
+    if server_url and connector_id and connector_token:
+        return ConnectorConfig(
+            server_url=server_url.rstrip("/"),
+            connector_id=connector_id,
+            connector_token=connector_token,
+        )
+
+    config_path = Path(args.config)
+    if config_path.exists():
+        return ConnectorConfig.load(config_path)
+
+    missing = []
+    if not server_url:
+        missing.append("--server-url")
+    if not connector_id:
+        missing.append("--connector-id")
+    if not connector_token:
+        missing.append("--connector-token")
+    missing.append(f"or config file {config_path}")
+    raise CliError("missing connector credentials: " + ", ".join(missing))
+
+
+def _response_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        text = response.text.strip()
+        return text[:300] if text else response.reason_phrase
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("message") or payload
+        return str(detail)
+    return str(payload)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
