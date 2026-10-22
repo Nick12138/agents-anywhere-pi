@@ -1565,7 +1565,11 @@ def build_notice(
     timeout: Any,
     runtime_id: str | None,
 ) -> SessionNotice:
-    blocking: dict[str, Any] = {"reason": "extension_ui", "method": method}
+    # 协议里 NoticeBlocking 只有 scope/targetId（服务端 NoticeBlocking 两个字段都必填），
+    # 前端也靠 scope=="session" and targetId==sessionId 才把 notice 当成阻塞交互渲染。
+    # 这里曾经写成 {"reason": "extension_ui", "method": ...}，导致被服务端校验拒绝、
+    # 前端永远看不到 confirm/select 弹窗。method 已经放在 source.method 里。
+    blocking: dict[str, Any] = {"scope": "session", "targetId": session_id}
     if isinstance(timeout, int) and timeout > 0:
         blocking["timeoutMs"] = timeout
     if method == "confirm":

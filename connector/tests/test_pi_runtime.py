@@ -907,3 +907,42 @@ def test_failed_assistant_message_projects_error_item(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_extension_ui_notice_blocking_matches_protocol() -> None:
+    """blocking 必须是 {scope: session, targetId: <sessionId>}。
+
+    服务端 NoticeBlocking 的 scope/targetId 都是必填字段，前端也只把
+    scope == "session" 且 targetId == sessionId 的 notice 当阻塞交互渲染。
+    早先写成 {"reason": "extension_ui", "method": ...} 会直接被服务端校验拒绝，
+    用户在 Web/客户端里永远看不到 confirm/select 弹窗。
+    """
+    from connector.runtimes.pi.runtime import build_notice
+
+    confirm = build_notice(
+        session_id="sess_1",
+        external_session_id="/tmp/pi/s1.jsonl",
+        request_id="req_1",
+        method="confirm",
+        title="要执行吗",
+        message=None,
+        options=None,
+        timeout=None,
+        runtime_id="rt-1",
+    )
+    assert confirm.blocking == {"scope": "session", "targetId": "sess_1"}
+    assert confirm.source["method"] == "confirm"
+
+    select = build_notice(
+        session_id="sess_1",
+        external_session_id="/tmp/pi/s1.jsonl",
+        request_id="req_2",
+        method="select",
+        title="选一个",
+        message="选哪个？",
+        options=["a", "b"],
+        timeout=3000,
+        runtime_id="rt-1",
+    )
+    assert select.blocking == {"scope": "session", "targetId": "sess_1", "timeoutMs": 3000}
+    assert select.source["method"] == "select"
