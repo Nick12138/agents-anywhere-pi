@@ -1027,11 +1027,30 @@ class PiRuntime(AgentRuntime):
             return summary
         summary = self._index.get(session_id)
         if summary is None:
+            # 服务端 id（sess_xxx）的别名不是目录扫描出来的，_refresh_index 重建
+            # _index 时会把它冲掉。session.interrupt 这类调用只带 sessionId、
+            # 不带 externalSessionId，只能靠持久的别名表把平台 id 找回来
+            # （否则就是「未知的 Pi 会话：sess_xxx」，界面上点了停止没反应）。
+            summary = self._summary_for_server_session_id(session_id)
+            if summary is not None:
+                self._index[session_id] = summary
+                return summary
             self._refresh_index()
-            summary = self._index.get(session_id)
+            summary = self._index.get(session_id) or self._summary_for_server_session_id(
+                session_id
+            )
+            if summary is not None:
+                self._index[session_id] = summary
         if summary is None:
             raise RuntimeInvalidRequestError(f"未知的 Pi 会话：{session_id}")
         return summary
+
+    def _summary_for_server_session_id(self, session_id: str) -> PiSessionFile | None:
+        """按别名表把服务端会话 id 还原成平台 id 对应的会话。"""
+        for canonical, server_id in self._server_session_ids.items():
+            if server_id == session_id:
+                return self._index.get(canonical)
+        return None
 
     def _session_args(self, summary: PiSessionFile) -> list[str]:
         args = ["--mode", "rpc", "--session", str(summary.path.resolve())]

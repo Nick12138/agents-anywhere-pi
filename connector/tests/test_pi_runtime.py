@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+
+import pytest
 import json
 from pathlib import Path
 
@@ -1279,6 +1281,61 @@ def test_user_message_published_as_soon_as_pi_writes_it(tmp_path: Path) -> None:
             if item.source.get("clientMessageId") == "cmid-new-turn"
         ]
         assert published, "用户消息落盘后应立刻推一条带 clientMessageId 的时间线"
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_server_session_id_survives_index_refresh(tmp_path: Path) -> None:
+    """服务端 id 的别名不能被目录重扫冲掉，否则点「停止」会报未知会话。
+
+    session.interrupt 的 params 只有 sessionId（服务端自己那套 sess_xxx），
+    不带 externalSessionId；而 _refresh_index 每次都会用平台 id 重建 _index，
+    之前注册的别名就丢了 —— 日志里就是
+    `session.interrupt ... 未知的 Pi 会话：sess_pH0_XJyKG3eBLQ`。
+    """
+    write_session(tmp_path, "one", session_entries())
+
+    async def run() -> None:
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10)
+        platform_id = listed[0].session_id
+        external_id = listed[0].external_session_id
+
+        # App 打开会话，服务端带自己的 id + external id 来读，connector 记下别名
+        await runtime.get_session_state("sess_server_1", external_id)
+        # 目录重扫（每 3s 一次；list_sessions 也会触发）把别名冲掉
+        runtime._refresh_index()
+        assert "sess_server_1" not in runtime._index
+
+        # 停止不再报「未知的 Pi 会话」
+        assert runtime._resolve("sess_server_1", None).path == runtime._index[platform_id].path
+        result = await runtime.interrupt_session("sess_server_1")
+        assert result.ok is True
+        assert result.result.get("interrupted") is False  # 没有运行中的进程
+
+        # 交互响应同理（respond_interaction 也是不带 external id 的入口）
+        runtime._handle_extension_request(
+            platform_id,
+            runtime._index[platform_id],
+            {
+                "type": "extension_ui_request",
+                "id": "req_1",
+                "method": "confirm",
+                "title": "继续？",
+                "message": None,
+            },
+        )
+        await asyncio.sleep(0)
+        with pytest.raises(Exception) as excinfo:
+            # 没有运行中的 pi 进程 → 拒绝，但绝不能是「未知的 Pi 会话」
+            await runtime.respond_interaction("sess_server_1", "req_1", "confirm", None)
+        assert "未知的 Pi 会话" not in str(excinfo.value)
         await runtime.stop()
 
     asyncio.run(run())
