@@ -949,6 +949,17 @@ class PiRuntime(AgentRuntime):
             await process.send("extension_ui_response", **payload)
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
+        # 立刻把这条交互收掉，否则客户端要等下一次 notices 轮询才消失。
+        self._spawn(
+            self.host.notice_upsert(
+                replace(
+                    interaction.notice,
+                    status="resolved",
+                    revision=interaction.notice.revision + 1,
+                    blocking=None,
+                )
+            )
+        )
         self._activate(session_id, "running", summary)
         return RuntimeOperationResult(ok=True)
 
@@ -1494,6 +1505,16 @@ class PiRuntime(AgentRuntime):
         self._notices.setdefault(session_id, {})[request_id] = PendingInteraction(
             notice=notice, method=str(method)
         )
+        # 和 claude/codex 一样即时上报：只靠周期性 session sync 上报的话，手机端要等
+        # 一个同步周期（~30s）才能看到弹窗，而且 sync 只在会话文件有变化时才推 notices。
+        logger.info(
+            "pi interaction notice published session_id={} notice_id={} method={} title={}",
+            session_id,
+            notice.notice_id,
+            method,
+            notice.title,
+        )
+        self._spawn(self.host.notice_upsert(notice))
         self._activate(session_id, "waiting_approval", summary)
 
     def _activate(self, session_id: str, status: RuntimeStatus, summary: PiSessionFile) -> None:

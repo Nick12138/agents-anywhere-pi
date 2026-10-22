@@ -159,8 +159,26 @@ async def read_session_notices(
     params: dict[str, Any],
 ) -> dict[str, Any]:
     parsed = SessionReadParams.parse(params)
-    notices = await runtime.get_session_notices(
+    try:
+        notices = await runtime.get_session_notices(
+            parsed.session_id,
+            parsed.external_session_id,
+        )
+    except Exception:
+        # Server-side callers swallow this failure (see
+        # read_session_notices_for_snapshot), so a broken read shows up as
+        # "the interaction card never appears" rather than an error.
+        logger.warning(
+            "session notices read failed session_id={} external_session_id={}",
+            parsed.session_id,
+            parsed.external_session_id,
+            exc_info=True,
+        )
+        raise
+    logger.info(
+        "session notices read session_id={} external_session_id={} notices={}",
         parsed.session_id,
         parsed.external_session_id,
+        len(notices),
     )
     return {"notices": [session_notice_payload(notice) for notice in notices]}

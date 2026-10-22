@@ -119,9 +119,13 @@ class FakeHost:
         self.upserts = []
         self.timelines = []
         self.attachments = {}
+        self.notices = []
 
     async def timeline_item_upsert(self, item) -> None:
         self.upserts.append(item)
+
+    async def notice_upsert(self, notice) -> None:
+        self.notices.append(notice)
 
     async def timeline_sync(self, **kwargs) -> None:
         self.timelines.append(kwargs)
@@ -946,3 +950,43 @@ def test_extension_ui_notice_blocking_matches_protocol() -> None:
     )
     assert select.blocking == {"scope": "session", "targetId": "sess_1", "timeoutMs": 3000}
     assert select.source["method"] == "select"
+
+
+def test_extension_ui_request_pushed_immediately(tmp_path: Path) -> None:
+    """pi 的交互 notice 必须当场推给服务端，不能只等 30s 一次的 session sync。
+
+    claude / codex 都是收到交互就 notice_upsert；pi 之前只把 notice 存本地，
+    手机端要等一个同步周期，且 sync 仅在会话文件变化时才带 notice。
+    """
+    write_session(tmp_path, "one", session_entries())
+
+    async def run() -> None:
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10)
+        session_id = listed[0].session_id
+        summary = runtime._index[session_id]
+        runtime._handle_extension_request(
+            session_id,
+            summary,
+            {
+                "type": "extension_ui_request",
+                "id": "req_1",
+                "method": "select",
+                "title": "[测试] 随便选一个",
+                "options": ["清晨", "深夜", "Type something."],
+            },
+        )
+        await asyncio.sleep(0)
+        assert [notice.notice_id for notice in host.notices] == ["req_1"]
+        notice = host.notices[0]
+        assert notice.type == "interaction"
+        assert notice.blocking == {"scope": "session", "targetId": session_id}
+        assert await runtime.get_session_notices(session_id) == (notice,)
+        await runtime.stop()
+
+    asyncio.run(run())
