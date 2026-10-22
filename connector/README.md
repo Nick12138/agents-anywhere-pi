@@ -57,6 +57,14 @@ uv run anywhere-cli start
 The default config path is `~/.agents-anywhere/connector.json`. Override it with
 `--config` or `AGENT_CONNECTOR_CONFIG`.
 
+Backend traffic (auth HTTP + the connector WebSocket) bypasses system/env proxies
+by default, because a local proxy is a common way to break the long-lived
+connection (`SSL: UNEXPECTED_EOF_WHILE_READING`, or a WebSocket handshake
+timeout that looks like an endless reconnect loop). Set
+`"bypassProxyForBackend": false` in `connector.json` (or
+`AGENT_CONNECTOR_BYPASS_PROXY=0`) when the machine must reach the server through
+a corporate proxy.
+
 Connector configuration, runtime ownership, sync state, and attachments all
 live under `~/.agents-anywhere` by default. Runtime sync cursors are stored as
 atomic JSON in `<connectorId>/<runtimeId>/sync-state.json`; runtime message

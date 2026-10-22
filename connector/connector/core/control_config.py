@@ -14,6 +14,7 @@ def default_config_payload() -> dict[str, Any]:
         "reconnectSeconds": 3,
         "syncExistingOnConnect": True,
         "syncIntervalSeconds": 30,
+        "bypassProxyForBackend": True,
         "statePath": None,
     }
 
@@ -27,6 +28,7 @@ def config_to_payload(config: ConnectorConfig) -> dict[str, Any]:
         "reconnectSeconds": config.reconnect_seconds,
         "syncExistingOnConnect": config.sync_existing_on_connect,
         "syncIntervalSeconds": config.sync_interval_seconds,
+        "bypassProxyForBackend": config.bypass_proxy_for_backend,
         "statePath": config.state_path,
     }
 
@@ -47,6 +49,7 @@ def config_from_params(params: Any) -> ConnectorConfig:
         reconnect_seconds=float(params.get("reconnectSeconds", 3)),
         sync_existing_on_connect=bool(params.get("syncExistingOnConnect", True)),
         sync_interval_seconds=float(params.get("syncIntervalSeconds", 30)),
+        bypass_proxy_for_backend=bool(params.get("bypassProxyForBackend", True)),
         state_path=(
             params.get("statePath")
             if isinstance(params.get("statePath"), str)

@@ -18,6 +18,11 @@ class ConnectorConfig:
     reconnect_seconds: float = 3
     sync_existing_on_connect: bool = True
     sync_interval_seconds: float = 30
+    # 连后端时是否绕过系统/环境代理。默认绕过：后端是本服务自己的 HTTP+WebSocket
+    # 长连接，走本机代理（Clash 之类）很容易被 TLS 拦截成
+    # `SSL: UNEXPECTED_EOF_WHILE_READING` / 握手超时，表现为 connector 一直重连。
+    # 需要经由公司代理出网的话，把它设为 false。
+    bypass_proxy_for_backend: bool = True
     state_path: str | None = None
 
     @classmethod
@@ -53,6 +58,10 @@ class ConnectorConfig:
                 True,
             ),
             sync_interval_seconds=float(os.environ.get("AGENT_CONNECTOR_SYNC_INTERVAL_SECONDS", "30")),
+            bypass_proxy_for_backend=_bool_env(
+                "AGENT_CONNECTOR_BYPASS_PROXY",
+                True,
+            ),
             state_path=os.environ.get("AGENT_CONNECTOR_STATE_FILE"),
         )
 
@@ -72,6 +81,7 @@ class ConnectorConfig:
             reconnect_seconds=float(data.get("reconnectSeconds", 3)),
             sync_existing_on_connect=bool(data.get("syncExistingOnConnect", True)),
             sync_interval_seconds=float(data.get("syncIntervalSeconds", 30)),
+            bypass_proxy_for_backend=bool(data.get("bypassProxyForBackend", True)),
             state_path=(
                 data.get("statePath")
                 if isinstance(data.get("statePath"), str)

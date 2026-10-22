@@ -257,7 +257,7 @@ class BackendRpcClient:
                 "Authorization": f"Bearer {access_token}",
                 "X-Device-OS": device_os(),
             },
-            proxy=None if is_loopback_url(self.config.server_url) else True,
+            proxy=None if self._backend_bypasses_proxy() else True,
         ) as ws:
             self._rpc.set_connection(ws)
             capabilities_task = asyncio.create_task(
@@ -521,9 +521,20 @@ class BackendRpcClient:
     def _get_http_client(self) -> httpx.AsyncClient | None:
         return self._http_client
 
+    def _backend_bypasses_proxy(self) -> bool:
+        """后端连接是否绕过系统/环境代理。
+
+        后端是本服务自己的 HTTP + WebSocket 长连接。本机挂着 Clash 之类的代理时，
+        127.0.0.1 之类的代理常把到后端的 TLS 掐断（`SSL: UNEXPECTED_EOF_WHILE_READING`）
+        或让 WS 握手超时，症状是 connector 无限重连、runtime 同步全失败。默认绕过，
+        需要走公司代理出网时把配置项 `bypassProxyForBackend` 设为 false。
+        """
+        return is_loopback_url(self.config.server_url) or self.config.bypass_proxy_for_backend
+
     def _new_http_client(self, timeout: httpx.Timeout | float) -> httpx.AsyncClient:
+        # trust_env=False 同时关掉 HTTP(S)_PROXY / .netrc 等隐式环境，纯直连后端。
         return httpx.AsyncClient(
-            timeout=timeout, trust_env=not is_loopback_url(self.config.server_url)
+            timeout=timeout, trust_env=not self._backend_bypasses_proxy()
         )
 
 
