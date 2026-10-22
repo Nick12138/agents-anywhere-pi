@@ -990,3 +990,53 @@ def test_extension_ui_request_pushed_immediately(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def test_notice_uses_server_session_id(tmp_path: Path) -> None:
+    """出站 notice 必须带服务端的会话 id，而不是 platform 的 sess_pi_...
+
+    服务端给 pi 会话另有一个 sess_xxx；notice.upsert 按 sessionId 查会话行，
+    查不到就静默丢弃（不像时间线会按 external session 重绑）。之前 notice 带的是
+    sess_pi_...，于是「状态到了、弹窗永远不来」。
+    """
+    write_session(tmp_path, "one", session_entries())
+
+    async def run() -> None:
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10)
+        platform_id = listed[0].session_id
+        external_id = listed[0].external_session_id
+        assert platform_id.startswith("sess_pi_")
+
+        # 服务端第一次带着自己的 id + external id 来读（App 打开会话就会发生）
+        state = await runtime.get_session_state("sess_server_1", external_id)
+        assert state is not None
+
+        runtime._handle_extension_request(
+            platform_id,
+            runtime._index[platform_id],
+            {
+                "type": "extension_ui_request",
+                "id": "req_1",
+                "method": "select",
+                "title": "选一个",
+                "options": ["a", "b"],
+            },
+        )
+        await asyncio.sleep(0)
+
+        pushed = host.notices[0]
+        assert pushed.session_id == "sess_server_1"
+        assert pushed.blocking == {"scope": "session", "targetId": "sess_server_1"}
+
+        notices = await runtime.get_session_notices("sess_server_1", None)
+        assert notices[0].session_id == "sess_server_1"
+        assert notices[0].blocking == {"scope": "session", "targetId": "sess_server_1"}
+        await runtime.stop()
+
+    asyncio.run(run())

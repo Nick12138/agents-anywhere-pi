@@ -165,6 +165,8 @@ class PiRuntime(AgentRuntime):
         self._active: dict[str, RuntimeStatus] = {}
         self._selections: dict[str, dict[str, str | None]] = {}
         self._notices: dict[str, dict[str, PendingInteraction]] = {}
+        # platform id（sess_pi_...） -> 服务端会话 id（sess_xxx），出站 notice 用后者
+        self._server_session_ids: dict[str, str] = {}
         self._snapshot_cache: dict[str, tuple[int, int, RuntimeTimelineSnapshot]] = {}
         # 已发布到服务端的时间线指纹；list_sessions 拿它对比文件当前指纹，
         # 决定是否需要重新同步（polling 模式靠这个上报增量）。
@@ -201,6 +203,25 @@ class PiRuntime(AgentRuntime):
         表现为回合结束通知丢了、clientMessageId 对不上导致消息重复。
         """
         return platform_session_id(self.host.connector_id, summary)
+
+    def _published_session_id(self, canonical: str) -> str:
+        """出站 payload 该用的 session id。
+
+        服务端给 pi 会话自己有 id（sess_xxx，由 session.create 生成），而扫描/事件侧
+        用的是 platform_session_id（sess_pi_...）。时间线、状态能被服务端按 external
+        session 重新绑定，但 notice.upsert 不会——它直接按 sessionId 查会话行，查不到
+        就当不存在**静默丢弃**。所以 notice 必须用服务端认识的那个 id。
+        """
+        return self._server_session_ids.get(canonical, canonical)
+
+    def _notice_for_publish(self, notice: SessionNotice, canonical: str) -> SessionNotice:
+        published = self._published_session_id(canonical)
+        if notice.session_id == published:
+            return notice
+        blocking = notice.blocking
+        if isinstance(blocking, Mapping):
+            blocking = {**blocking, "targetId": published}
+        return replace(notice, session_id=published, blocking=blocking)
 
     def _agent_dir(self) -> Path:
         return agent_dir(self.values)
@@ -916,7 +937,9 @@ class PiRuntime(AgentRuntime):
             summary = self._index.get(session_id)
         canonical = self._canonical_session_id(summary) if summary is not None else session_id
         pending = self._notices.get(canonical, {})
-        return tuple(item.notice for item in pending.values())
+        return tuple(
+            self._notice_for_publish(item.notice, canonical) for item in pending.values()
+        )
 
     async def respond_interaction(
         self,
@@ -950,16 +973,13 @@ class PiRuntime(AgentRuntime):
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
         # 立刻把这条交互收掉，否则客户端要等下一次 notices 轮询才消失。
-        self._spawn(
-            self.host.notice_upsert(
-                replace(
-                    interaction.notice,
-                    status="resolved",
-                    revision=interaction.notice.revision + 1,
-                    blocking=None,
-                )
-            )
+        closed = replace(
+            self._notice_for_publish(interaction.notice, session_id),
+            status="resolved",
+            revision=interaction.notice.revision + 1,
+            blocking=None,
         )
+        self._spawn(self.host.notice_upsert(closed))
         self._activate(session_id, "running", summary)
         return RuntimeOperationResult(ok=True)
 
@@ -977,6 +997,11 @@ class PiRuntime(AgentRuntime):
             if summary is None:
                 raise RuntimeInvalidRequestError("会话文件不可读或格式不正确")
             self._index[session_id] = summary
+            canonical = platform_session_id(self.host.connector_id, summary)
+            if session_id != canonical:
+                # 服务端用自己那套 id 调过来，记下来：出站 notice 要用它，
+                # 否则会被服务端当成不存在的会话丢掉。
+                self._server_session_ids[canonical] = session_id
             return summary
         summary = self._index.get(session_id)
         if summary is None:
@@ -1507,14 +1532,15 @@ class PiRuntime(AgentRuntime):
         )
         # 和 claude/codex 一样即时上报：只靠周期性 session sync 上报的话，手机端要等
         # 一个同步周期（~30s）才能看到弹窗，而且 sync 只在会话文件有变化时才推 notices。
+        published = self._notice_for_publish(notice, session_id)
         logger.info(
-            "pi interaction notice published session_id={} notice_id={} method={} title={}",
-            session_id,
-            notice.notice_id,
+            "pi interaction notice published session_id=%s notice_id=%s method=%s title=%s",
+            published.session_id,
+            published.notice_id,
             method,
-            notice.title,
+            published.title,
         )
-        self._spawn(self.host.notice_upsert(notice))
+        self._spawn(self.host.notice_upsert(published))
         self._activate(session_id, "waiting_approval", summary)
 
     def _activate(self, session_id: str, status: RuntimeStatus, summary: PiSessionFile) -> None:
