@@ -111,6 +111,15 @@ git fetch upstream main
 
 > 注意：`git fetch upstream` 只往 `.git/objects` 写对象，不动工作区、不建分支。
 
+基线提交在本地已经打了一个 tag `upstream-baseline-0020cf7f`（指向上游 `0020cf7f`，
+不属于本仓库历史，仅用于 diff）。所以下面 `git diff 0020cf7f ...` 可以**离线**跑，
+不需要每次先 fetch。换基线时同步打新 tag：
+
+```bash
+git tag upstream-baseline-<新sha前8位> <新sha>
+git tag -d upstream-baseline-0020cf7f   # 旧的可留可删
+```
+
 ### 5.1 先看改了什么，别急着 apply
 
 ```bash
@@ -246,11 +255,12 @@ README 徽章写 MIT，但 `gh api repos/anywhere-labs/Agents-Anywhere/license` 
 
 ## 8. 同步记录表
 
-**每次同步后更新这张表，并同步修改第 1 节的「基线快照」和第 5.1 节的 `BASE`。**
+**每次同步后更新这张表，并同步修改第 1 节的「基线快照」、第 5.1 节的 `BASE`、
+以及第 5.0 节的基线 tag。**
 
 | 日期 | 上游基线 sha | 上游版本 | 本地版本 | 结果 |
 |---|---|---|---|---|
-| 2026-10-21 | `0020cf7f` | main（2.1.0 未发布） | `2.1.0+piabyss.17` | 初始快照 + 24 个 Pi runtime 提交 |
+| 2026-10-21 | `0020cf7f` | main（2.1.0 未发布） | `2.1.0+piabyss.17` | 初始快照 + 24 个 Pi runtime 提交；基线 tag `upstream-baseline-0020cf7f` |
 | （待同步） | `6fb6b165` | main | — | 落后 8 个提交，含 #334/#380/#383/#384/#387/#393/#394/#375 |
 
 ## 9. 速查命令
