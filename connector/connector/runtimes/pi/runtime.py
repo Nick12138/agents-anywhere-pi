@@ -69,6 +69,10 @@ from connector.runtimes.pi.sessions import (
 logger = logging.getLogger(__name__)
 
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
+# ask 插件写进 `ui.input` placeholder 的结构化标记前缀（见 my-pi-plugins
+# packages/pi-ask-user-question/src/aa-marker.ts）。pi 的 RPC 模式会丢弃 ui.input
+# 的第三个参数，多选只能靠这行 JSON 才能还原成真勾选框。
+AA_MARKER_PREFIX = "#aa-ask:"
 CATALOG_TTL_SECONDS = 60.0
 INDEX_REFRESH_SECONDS = 3.0
 MAX_SNAPSHOT_ITEMS = 5_000
@@ -140,6 +144,10 @@ class LiveStream:
 class PendingInteraction:
     notice: SessionNotice
     method: str
+    # 多选（ask 插件把选项藏在 placeholder 的 AA 标记里）：回答要换算成 “1,3”
+    multiple: bool = False
+    # 回退上一题时该回传的哨兵值（插件按 `↩` 前缀识别）
+    back_value: str | None = None
 
 
 class PiRuntime(AgentRuntime):
@@ -963,8 +971,11 @@ class PiRuntime(AgentRuntime):
             if isinstance(input_data, Mapping) and isinstance(input_data.get("confirmed"), bool):
                 confirmed = bool(input_data["confirmed"])
             payload["confirmed"] = confirmed
+        elif action_id == "back" and interaction.back_value:
+            # 插件按 `↩` 前缀识别回退，原样把哨兵串送回去。
+            payload["value"] = interaction.back_value
         else:
-            value = _answer_value(input_data)
+            value = _answer_value(input_data, multiple=interaction.multiple)
             if value is None:
                 raise RuntimeInvalidRequestError("回答缺少选项或文本")
             payload["value"] = value
@@ -973,10 +984,11 @@ class PiRuntime(AgentRuntime):
         except PiRpcError as exc:
             raise RuntimeInvalidRequestError(str(exc)) from exc
         # 立刻把这条交互收掉，否则客户端要等下一次 notices 轮询才消失。
+        # SessionNotice 没有 revision 字段（payload 里服务端默认 1），两端客户端都
+        # 是 `revision >= 已存`，同 revision 的状态变更会被接受。
         closed = replace(
             self._notice_for_publish(interaction.notice, session_id),
             status="resolved",
-            revision=interaction.notice.revision + 1,
             blocking=None,
         )
         self._spawn(self.host.notice_upsert(closed))
@@ -1516,6 +1528,8 @@ class PiRuntime(AgentRuntime):
             return
         title = record.get("title") if isinstance(record.get("title"), str) else "Pi 请求确认"
         message = record.get("message") if isinstance(record.get("message"), str) else None
+        placeholder = record.get("placeholder") if isinstance(record.get("placeholder"), str) else None
+        _, marker = _split_aa_marker(placeholder)
         notice = build_notice(
             session_id=session_id,
             external_session_id=str(summary.path.resolve()),
@@ -1524,11 +1538,15 @@ class PiRuntime(AgentRuntime):
             title=title,
             message=message,
             options=record.get("options"),
+            placeholder=placeholder,
             timeout=record.get("timeout"),
             runtime_id=self.config.runtime_id,
         )
         self._notices.setdefault(session_id, {})[request_id] = PendingInteraction(
-            notice=notice, method=str(method)
+            notice=notice,
+            method=str(method),
+            multiple=marker is not None and marker.get("kind") == "multiSelect",
+            back_value=_marker_back_value(marker),
         )
         # 和 claude/codex 一样即时上报：只靠周期性 session sync 上报的话，手机端要等
         # 一个同步周期（~30s）才能看到弹窗，而且 sync 只在会话文件有变化时才推 notices。
@@ -1579,7 +1597,7 @@ def _is_under(path: Path, root: Path) -> bool:
         return False
 
 
-def _answer_value(input_data: Mapping[str, Any] | None) -> str | None:
+def _answer_value(input_data: Mapping[str, Any] | None, *, multiple: bool = False) -> str | None:
     if not isinstance(input_data, Mapping):
         return None
     direct = input_data.get("value")
@@ -1593,10 +1611,14 @@ def _answer_value(input_data: Mapping[str, Any] | None) -> str | None:
         return None
     custom = first.get("customText")
     if isinstance(custom, str) and custom.strip():
-        return custom
+        # 插件把非编号输入当成自定义答案，所以自定义文本优先。
+        return custom.strip()
     option_ids = first.get("optionIds")
-    if isinstance(option_ids, list) and option_ids and isinstance(option_ids[0], str):
-        return option_ids[0]
+    if isinstance(option_ids, list):
+        ids = [item for item in option_ids if isinstance(item, str) and item]
+        if ids:
+            # 多选：插件的 parseMultiSelection 只认 1-based 序号串（"1,3"）。
+            return ",".join(ids) if multiple else ids[0]
     return None
 
 
@@ -1609,6 +1631,7 @@ def build_notice(
     title: str,
     message: str | None,
     options: Any,
+    placeholder: str | None = None,
     timeout: Any,
     runtime_id: str | None,
 ) -> SessionNotice:
@@ -1640,6 +1663,8 @@ def build_notice(
             runtime_id=runtime_id,
         )
     labels = [option for option in options if isinstance(option, str)] if isinstance(options, list) else []
+    placeholder_text, marker = _split_aa_marker(placeholder)
+    actions: tuple[Mapping[str, Any], ...]
     if method == "select":
         question = InputRequestQuestion(
             question_id="value",
@@ -1649,6 +1674,19 @@ def build_notice(
             multiple=False,
             allow_custom=False,
         )
+        actions = (InputRequestForm(questions=(question,)).action(label="提交"),)
+    elif marker is not None:
+        # ask 插件把多选的结构化信息藏在 placeholder 的标记行里（pi 的 RPC 模式
+        # 会丢弃 ui.input 的第三个参数，只能走这条道），解出来就是真勾选框。
+        question = _marker_question(marker, title)
+        form = InputRequestForm(questions=(question,))
+        back_value = _marker_back_value(marker)
+        actions = (form.action(label="提交"),)
+        if back_value is not None:
+            actions = (
+                *actions,
+                {"actionId": "back", "label": "上一题", "style": "secondary"},
+            )
     else:
         question = InputRequestQuestion(
             question_id="value",
@@ -1658,20 +1696,87 @@ def build_notice(
             multiple=False,
             allow_custom=True,
         )
-    form = InputRequestForm(questions=(question,))
+        actions = (InputRequestForm(questions=(question,)).action(label="提交"),)
+        # 纯文本输入（非标记）：把去掉标记的 placeholder 当提示显示，
+        # 否则宿主只知道标题，看不到「怎么填」。
+        if placeholder_text:
+            message = placeholder_text
     return SessionNotice(
         notice_id=request_id,
         session_id=session_id,
         runtime="pi",
         type="interaction",
         title=title,
-        message=message,
+        message=message if marker is None else None,
         severity="info",
         status="open",
         interaction_type="input_request",
         blocking=blocking,
         response_required=True,
-        actions=(form.action(label="提交"),),
+        actions=actions,
         source={"externalSessionId": external_session_id, "method": method},
         runtime_id=runtime_id,
+    )
+
+
+def _split_aa_marker(text: str | None) -> tuple[str | None, Mapping[str, Any] | None]:
+    """从 placeholder 里摘下 ask 插件的 AA 标记行（它是单行 JSON，永远在末尾）。"""
+    if not text or AA_MARKER_PREFIX not in text:
+        return text, None
+    lines = text.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not line.startswith(AA_MARKER_PREFIX):
+            continue
+        try:
+            payload = json.loads(line[len(AA_MARKER_PREFIX) :])
+        except ValueError:
+            return text, None
+        if not isinstance(payload, Mapping):
+            return text, None
+        del lines[index]
+        return "\n".join(lines).strip() or None, payload
+    return text, None
+
+
+def _marker_back_value(marker: Mapping[str, Any] | None) -> str | None:
+    """只有标记显式声明可回退时才认（第一题没有上一题）。"""
+    if marker is None or marker.get("allowBack") is not True:
+        return None
+    value = marker.get("backValue")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _marker_question(marker: Mapping[str, Any], title: str) -> InputRequestQuestion:
+    """按 AA 标记构造多选题。选项 id 用 1-based 序号，插件正是按序号解析多选。"""
+    options: list[InputRequestOption] = []
+    raw_options = marker.get("options")
+    if isinstance(raw_options, list):
+        for raw in raw_options:
+            if not isinstance(raw, Mapping):
+                continue
+            label = raw.get("label")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            description = raw.get("description")
+            options.append(
+                InputRequestOption(
+                    option_id=str(len(options) + 1),
+                    label=label.strip(),
+                    description=(
+                        description.strip()
+                        if isinstance(description, str) and description.strip()
+                        else None
+                    ),
+                )
+            )
+    prompt = marker.get("prompt")
+    header = marker.get("header")
+    return InputRequestQuestion(
+        question_id="value",
+        prompt=prompt.strip() if isinstance(prompt, str) and prompt.strip() else title,
+        options=tuple(options),
+        header=header.strip() if isinstance(header, str) and header.strip() else None,
+        multiple=marker.get("kind") == "multiSelect",
+        allow_custom=bool(marker.get("allowCustom", True)),
     )

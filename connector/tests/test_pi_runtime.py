@@ -1040,3 +1040,166 @@ def test_notice_uses_server_session_id(tmp_path: Path) -> None:
         await runtime.stop()
 
     asyncio.run(run())
+
+
+def _multi_marker_placeholder() -> str:
+    import json as _json
+
+    marker = {
+        "v": 1,
+        "kind": "multiSelect",
+        "prompt": "想改哪些地方？",
+        "header": "范围",
+        "questionIndex": 1,
+        "questionCount": 1,
+        "allowCustom": True,
+        "allowBack": True,
+        "backValue": "↩ 修改上一题",
+        "options": [
+            {"label": "前端", "description": "改 UI"},
+            {"label": "后端", "description": "改接口"},
+            {"label": "文档"},
+        ],
+    }
+    return (
+        "1. 前端 — 改 UI\n2. 后端 — 改接口\n3. 文档\n\n"
+        'Enter the numbers of all that apply, comma-separated (e.g. "1,3").\n'
+        "↩ 修改上一题 = go back and change the previous answer\n"
+        f"#aa-ask:{_json.dumps(marker, ensure_ascii=False)}"
+    )
+
+
+def test_multi_select_marker_builds_checkbox_question() -> None:
+    """ask 插件的多选把结构藏在 placeholder 标记里，connector 要还原成勾选框。
+
+    pi 的 RPC 模式丢弃 ui.input 的第三个参数（piabyss 那套 optionDetails），
+    所以没有这行标记时，多选在 AA 只能退化成空文本框。
+    """
+    from connector.runtimes.pi.runtime import build_notice
+
+    notice = build_notice(
+        session_id="sess_1",
+        external_session_id="/tmp/pi/s1.jsonl",
+        request_id="req_multi",
+        method="input",
+        title="[范围] 想改哪些地方？",
+        message=None,
+        options=None,
+        placeholder=_multi_marker_placeholder(),
+        timeout=None,
+        runtime_id="rt-1",
+    )
+    assert notice.interaction_type == "input_request"
+    # 标记里的选项清单不该再当正文显示（选项已经结构化渲染）
+    assert notice.message is None
+    action = notice.actions[0]
+    ui_schema = action["input"]["uiSchema"]
+    assert ui_schema["component"] == "inputRequest"
+    question = ui_schema["questions"][0]
+    assert question["multiple"] is True
+    assert question["allowCustom"] is True
+    assert question["prompt"] == "想改哪些地方？"
+    assert question["header"] == "范围"
+    assert [option["id"] for option in question["options"]] == ["1", "2", "3"]
+    assert [option["label"] for option in question["options"]] == ["前端", "后端", "文档"]
+    assert question["options"][0]["description"] == "改 UI"
+    assert [item["actionId"] for item in notice.actions] == ["submit", "back"]
+
+
+def test_multi_select_answers_join_ordinals_and_back_sends_sentinel(tmp_path: Path) -> None:
+    """多选要回传 "1,3"（插件只认 1-based 序号），「上一题」回传 `↩` 哨兵值。"""
+    from connector.runtimes.pi.runtime import build_notice
+
+    write_session(tmp_path, "one", session_entries())
+
+    async def run() -> None:
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10)
+        sid = listed[0].session_id
+        key = str(runtime._index[sid].path.resolve())
+
+        sent: list[dict] = []
+
+        class FakeProcess:
+            running = True
+
+            async def send(self, method, **fields):
+                sent.append({"method": method, **fields})
+
+            async def close(self) -> None:
+                return None
+
+        runtime._processes[key] = FakeProcess()  # type: ignore[assignment]
+        record = {
+            "type": "extension_ui_request",
+            "id": "req_multi",
+            "method": "input",
+            "title": "[范围] 想改哪些地方？",
+            "placeholder": _multi_marker_placeholder(),
+        }
+        runtime._handle_extension_request(sid, runtime._index[sid], record)
+        await asyncio.sleep(0)
+        pending = runtime._notices[sid]["req_multi"]
+        assert pending.multiple is True
+        assert pending.back_value == "↩ 修改上一题"
+
+        result = await runtime.respond_interaction(
+            sid,
+            "req_multi",
+            "submit",
+            {"answers": {"value": {"optionIds": ["1", "3"]}}},
+        )
+        assert result.ok is True
+        assert sent[-1] == {
+            "method": "extension_ui_response",
+            "id": "req_multi",
+            "value": "1,3",
+        }
+
+        # 「上一题」：回传标记里的哨兵串，插件按 `↩` 前缀识别回退
+        runtime._handle_extension_request(sid, runtime._index[sid], record)
+        await asyncio.sleep(0)
+        await runtime.respond_interaction(sid, "req_multi", "back", None)
+        assert sent[-1]["value"] == "↩ 修改上一题"
+
+        # 自定义文本优先（插件把非编号输入当自定义答案）
+        runtime._handle_extension_request(sid, runtime._index[sid], record)
+        await asyncio.sleep(0)
+        await runtime.respond_interaction(
+            sid,
+            "req_multi",
+            "submit",
+            {"answers": {"value": {"optionIds": [], "customText": "全都要"}}},
+        )
+        assert sent[-1]["value"] == "全都要"
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_input_without_marker_keeps_text_prompt() -> None:
+    """非标记的 ui.input（如单选后的自由输入）仍是纯文本框，但正文带上提示。"""
+    from connector.runtimes.pi.runtime import build_notice
+
+    notice = build_notice(
+        session_id="sess_1",
+        external_session_id="/tmp/pi/s1.jsonl",
+        request_id="req_text",
+        method="input",
+        title="补充说明",
+        message=None,
+        options=None,
+        placeholder="写点什么",
+        timeout=None,
+        runtime_id="rt-1",
+    )
+    assert notice.message == "写点什么"
+    question = notice.actions[0]["input"]["uiSchema"]["questions"][0]
+    assert question["multiple"] is False
+    assert question["options"] == []
+    assert question["allowCustom"] is True
