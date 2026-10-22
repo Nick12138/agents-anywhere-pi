@@ -55,8 +55,9 @@ ln -sfn "$PWD/connector/connector" ~/.pi/agent/piabyss/remote/tools/anywhere-cli
 这个仓库是唯一维护的 connector 源码，日常改动直接在这里提交、推送；
 新设备从同一个 `git+https` 地址安装，不需要再手工同步第二份副本。
 
-上游更新时，把 `anything-labs/Agents-Anywhere` 的 `connector/` 变更合并进来即可
-（本仓库没有保留上游 git 历史，所以是目录级同步，不是 git merge）。
+上游更新时，**先读 [`docs/UPSTREAM-SYNC.md`](docs/UPSTREAM-SYNC.md)**：里面有基线 sha、
+更新流程、冲突高发点和陷阱清单。要点是本仓库没有保留上游 git 历史，
+所以只能按 `connector/`、`contracts/` 做目录级 diff + 3 路 apply，**不能用 git merge**。
 
 如果自建 Agents Anywhere 服务端，还需要应用
 [`patches/server-allow-pi-runtime.patch`](patches/server-allow-pi-runtime.patch)，
