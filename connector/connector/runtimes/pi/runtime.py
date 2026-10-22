@@ -78,6 +78,11 @@ INDEX_REFRESH_SECONDS = 3.0
 MAX_SNAPSHOT_ITEMS = 5_000
 # 流式推送节流：太快会把 websocket 刷爆，太慢手机上看着卡。
 STREAM_PUSH_MIN_INTERVAL_SECONDS = 0.12
+# pi 把用户消息写进 JSONL 是异步的：agent_start 那一刻文件可能还是空的。
+# 发送后盯着文件指纹，一有写入就立刻推一次时间线（否则自己的消息要等下一轮
+# 推送才上台，期间只有乐观气泡，AI 的流式条目会跑到它上面）。
+USER_WRITE_PUBLISH_TIMEOUT_SECONDS = 3.0
+USER_WRITE_PUBLISH_POLL_SECONDS = 0.1
 # 单个流式气泡最多推这么多字，剩下的等回合结束的完整快照。
 STREAM_MAX_CHARS = 100_000
 # 图片直接塞进 pi 的 RPC（base64），太大就落盘让 pi 自己读。
@@ -711,6 +716,8 @@ class PiRuntime(AgentRuntime):
         # 那条先发出去的条目要是缺 clientMessageId，服务端按 contentHash 判定
         # 未变化，之后就再也补不上了（客户端于是多出一条乐观气泡）。
         self._remember_client_message(session_id, client_message_id, content, attachment_meta)
+        # 发送前的文件指纹：pi 一落盘就补推时间线，让这条消息马上有平台条目。
+        marker_before = _file_marker(summary.path)
         running = self._active.get(session_id) in {"running", "waiting_approval", "stopping"}
         extra: dict[str, Any] = {"images": images} if images else {}
         try:
@@ -735,6 +742,9 @@ class PiRuntime(AgentRuntime):
         )
         if disposition in {"started", "queued"}:
             self._activate(session_id, "running", summary)
+            self._spawn(
+                self._publish_timeline_on_first_write(session_id, summary, marker_before)
+            )
         return RuntimeOperationResult(
             ok=True,
             result={
@@ -1403,6 +1413,30 @@ class PiRuntime(AgentRuntime):
         if not live:
             return snapshot
         return replace(snapshot, items=(*snapshot.items, *live))
+
+    async def _publish_timeline_on_first_write(
+        self,
+        session_id: str,
+        summary: PiSessionFile,
+        seen_marker: str | None,
+        *,
+        timeout: float = USER_WRITE_PUBLISH_TIMEOUT_SECONDS,
+        interval: float = USER_WRITE_PUBLISH_POLL_SECONDS,
+    ) -> None:
+        """等 pi 把这条用户消息写进会话文件，一落盘立刻推时间线。
+
+        pi 走 RPC 时用户消息是异步写盘的，`agent_start` 到达那一刻 JSONL 可能还
+        是空的（实测 items=0），于是这条消息本身要等下一次推送（多半是回合结束）
+        才有平台条目。这期间客户端只剩乐观气泡挂在末尾，而 AI 的流式条目已经先
+        到，看起来就像「回复跑到了我发的消息上面」，刷新后才恢复。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            marker = _file_marker(summary.path)
+            if marker is not None and marker != seen_marker:
+                await self._publish_timeline(session_id, summary)
+                return
 
     async def _publish_timeline(self, session_id: str, summary: PiSessionFile) -> None:
         """RPC 回合事件到达时立刻推一次时间线，并发完就记下指纹避免重复推。"""

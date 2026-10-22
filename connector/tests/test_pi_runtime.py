@@ -1203,3 +1203,82 @@ def test_input_without_marker_keeps_text_prompt() -> None:
     assert question["multiple"] is False
     assert question["options"] == []
     assert question["allowCustom"] is True
+
+
+def test_user_message_published_as_soon_as_pi_writes_it(tmp_path: Path) -> None:
+    """pi 异步写盘：用户消息一落盘就要推时间线，别等下一轮（回合结束）。
+
+    之前只在 agent_start 推一次，而那一刻 JSONL 往往还是空的 → 自己的消息迟迟
+    没有平台条目，客户端只剩乐观气泡挂在末尾，AI 的流式条目已经先到，视觉上
+    就成了「回复在我的消息上面」（刷新后按 order 重排才正常）。
+    """
+
+    async def run() -> None:
+        path = write_session(tmp_path, "one", session_entries())
+        provider = PiProvider()
+        config = await provider.validate_config(
+            {"agentDir": str(tmp_path), "sessionDir": str(tmp_path)}
+        )
+        host = FakeHost()
+        runtime = await provider.create_runtime(config, host)
+        listed = await runtime.list_sessions(limit=10, force=True)
+        sid, ext = listed[0].session_id, listed[0].external_session_id
+
+        def append_user_message() -> None:
+            # 模拟 pi 在 agent_start 之后才把用户消息写进 JSONL
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "u2",
+                            "parentId": "n1",
+                            "timestamp": "2026-01-01T00:00:05.000Z",
+                            "message": {"role": "user", "content": "新的一轮", "timestamp": 5},
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+        class FakeProcess:
+            running = True
+
+            async def request(self, command, timeout=None, **fields):
+                if command == "prompt":
+                    # 模拟写盘延迟：此刻文件还没变
+                    asyncio.get_running_loop().call_later(0.15, append_user_message)
+                return {"disposition": "started"}
+
+            async def send(self, command, **fields) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        async def fake_ensure(_summary):
+            return FakeProcess()
+
+        runtime._ensure_process = fake_ensure  # type: ignore[method-assign]
+        host.timelines.clear()
+        await runtime.start_turn(sid, ext, "新的一轮", {}, (), "cmid-new-turn")
+
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            if any(
+                item.source.get("clientMessageId") == "cmid-new-turn"
+                for snapshot in host.timelines
+                for item in snapshot["items"]
+            ):
+                break
+
+        published = [
+            item
+            for snapshot in host.timelines
+            for item in snapshot["items"]
+            if item.source.get("clientMessageId") == "cmid-new-turn"
+        ]
+        assert published, "用户消息落盘后应立刻推一条带 clientMessageId 的时间线"
+        await runtime.stop()
+
+    asyncio.run(run())
