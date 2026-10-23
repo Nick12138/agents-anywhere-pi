@@ -6,3 +6,26 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# ---- 运行期凭据：绝不上传 ----
+# connector 配对令牌（拿到就能远程驱动这台机器）
+connector.json
+**/connector.json
+.agents-anywhere/
+# pi 运行时配置：含各供应商 apiKey / OAuth 凭据
+auth.json
+**/auth.json
+models.json
+settings.json
+settings.local.json
+# 通用
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+*.log
+
+# 运行时下载的原生组件与临时产物
+umid/
+*.pid

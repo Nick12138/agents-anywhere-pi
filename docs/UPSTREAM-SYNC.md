@@ -12,7 +12,7 @@
 
 | 项 | 值（2026-10-22） |
 |---|---|
-| 本仓库 | `Nick12138/agents-anywhere-pi`（GitHub），本地 `C:\Users\liu\Documents\我的项目\agents-anywhere-pi` |
+| 本仓库 | `Nick12138/agents-anywhere-pi`（GitHub），本地 `C:\Users\example\Documents\我的项目\agents-anywhere-pi` |
 | 上游 | `https://github.com/anywhere-labs/Agents-Anywhere` |
 | 本地分支 | `main`，24 个提交，最新 `480484f2` |
 | 基线快照 | 上游 `0020cf7f`（2026-10-21T10:52:25Z，PR #390「fix(android): Markdown 引用块闪退」时的 main） |
@@ -104,7 +104,7 @@ android                         20   （无关）
 ### 5.0 前置：第一次做时补齐 upstream remote
 
 ```bash
-cd /c/Users/liu/Documents/我的项目/agents-anywhere-pi
+cd /c/Users/example/Documents/我的项目/agents-anywhere-pi
 git remote add upstream https://github.com/anywhere-labs/Agents-Anywhere.git   # 只需一次
 git fetch upstream main
 ```
@@ -221,7 +221,7 @@ README 徽章写 MIT，但 `gh api repos/anywhere-labs/Agents-Anywhere/license` 
 
 ### 6.6 Windows 环境相关
 
-- 上游有多处修 Windows 的中文用户名、含空格路径、保留端口段问题（#144/#164/#217/#380/#384）——**这些修复值得优先跟**，因为本机就是 `Nick-Office` + 中文项目路径
+- 上游有多处修 Windows 的中文用户名、含空格路径、保留端口段问题（#144/#164/#217/#380/#384）——**这些修复值得优先跟**，因为本机就是 `example-host` + 中文项目路径
 - 你的 `runtimes/pi/discovery.py` 在 Windows 上从 PATH 找 `pi` 可执行文件（历史提交 `115452cf`），上游若改进程启动方式要复核
 - PiAbyss 传的 `connectorSource` 是**带中文和空格的本地路径**，`uv tool install --from` 对它敏感；同步后重装失败先怀疑路径
 
@@ -266,7 +266,7 @@ README 徽章写 MIT，但 `gh api repos/anywhere-labs/Agents-Anywhere/license` 
 ## 9. 速查命令
 
 ```bash
-cd /c/Users/liu/Documents/我的项目/agents-anywhere-pi
+cd /c/Users/example/Documents/我的项目/agents-anywhere-pi
 
 # 落后多少个提交（上游 main 相对本地基线）
 git fetch upstream main && git log --oneline 0020cf7f..upstream/main | wc -l
